@@ -328,9 +328,19 @@ else:
                 worker_status=json.loads(status_file.read_text(encoding='utf-8'))
                 st.info(worker_status['state'])
                 if worker_status.get('filled'):st.write('Filled fields: '+', '.join(worker_status['filled']))
+                inspection=worker_status.get('inspection')
+                if inspection:
+                    with st.expander('Current form: fields and items needing attention',expanded=True):
+                        st.caption(f"{inspection['portal']} · {inspection['required_blank']} visibly blank required fields. This is an advisory snapshot, not confirmation that the application is complete.")
+                        st.dataframe(pd.DataFrame(inspection['fields']),hide_index=True,use_container_width=True)
+                        for warning in inspection.get('warnings',[]):st.warning(warning)
                 if worker_status.get('error'):st.error(worker_status['error'])
             except (ValueError,OSError):pass
         if st.button('Refresh browser status'):st.rerun()
+        if st.button('Inspect current browser page',disabled=not running):
+            control.mkdir(parents=True,exist_ok=True)
+            (control/f'{jid}.command').write_text('inspect',encoding='utf-8')
+            st.success('Requested a read-only field inspection. Refresh browser status to see the report.')
         if st.button('Fill current browser page',disabled=not running):
             control.mkdir(parents=True,exist_ok=True)
             (control/f'{jid}.command').write_text('fill',encoding='utf-8')

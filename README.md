@@ -98,6 +98,32 @@ waits for your click after login/navigation and can be repeated. Final submissio
 dropdown certifications, citizenship, clearance and demographic answers remain
 manual, including when those questions were accidentally placed in custom JSON.
 
+**Inspect current browser page** in Review & Launch reads visible form controls,
+including those inside frames, and reports blank required fields, available
+profile/custom-answer matches, repeated labels, login controls, attachments and
+questions needing manual attention. It does not change the form or record input
+values. Inspection runs on opening a worker and after each autofill, and can be
+requested again after login/navigation. Refresh browser status to see the latest
+snapshot. Custom widgets and hidden future steps can be missed; the report does
+not establish that an application is complete.
+
+## Reference projects and reuse
+
+Reviewed against the GitHub job-application-automation topic on October 22, 2026:
+
+| Project | Useful design ideas | Reuse review |
+| --- | --- | --- |
+| [suxrobGM/jobpilot](https://github.com/suxrobGM/jobpilot) | Separate dashboard/browser worker, per-job progress, verifiable resume facts | [MIT license](https://github.com/suxrobGM/jobpilot/blob/main/LICENSE) verified; direct reuse would retain its notice |
+| [Job Application Workbench](https://github.com/jimpeel-tech/job-application-workbench) | Reusable answers, local matching, source-based document generation | [MIT license](https://github.com/jimpeel-tech/job-application-workbench/blob/main/LICENSE) verified; direct reuse would retain its notice |
+| [AutoApply](https://github.com/Liam-Frost/AutoApply) | Separate eligibility rules from semantic fit, durable tasks, review queue | [PolyForm Noncommercial](https://github.com/Liam-Frost/AutoApply/blob/master/LICENSE); no code imported |
+| [Workday copilot](https://github.com/rifattahmid/workday-job-application-copilot) | Workday-specific sections and field detection | Root LICENSE not found during review; Australian defaults and agreement automation are unsuitable for our profile flow; no code imported |
+| [JobMatchAI](https://github.com/wadekarg/JobMatchAI) | Question classification, reusable Q&A, field-level explanations | README says MIT but root LICENSE was not found during review; no code imported |
+
+The form inspector is an independent implementation of the general field-inventory
+idea. No source files or snippets from these projects have been vendored or copied.
+Next candidates are an adapter interface for Workday/Greenhouse forms and optional
+semantic matching with evidence-backed recommendations. They are not yet implemented.
+
 ## Discover jobs from careers pages
 
 Choose **Discover Jobs** in the sidebar. The eight supplied employer URLs are

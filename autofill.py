@@ -1,9 +1,10 @@
 """Conservative, review-first browser helper. Does not submit forms or defeat access controls."""
-import argparse,json,time,re
+import argparse,json,time
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 from db import DATA,get_job,profile
 from browser_sessions import session_lock, state_path, save_state
+from form_inspection import inspect_page, requires_manual_answer
 
 FIELDS={
  'first_name':['First Name','Given Name','First name'],
@@ -44,7 +45,7 @@ def fill_current(page, applicant, answers, resume):
     for label,value in answers.items():
         # Keep legal/eligibility certifications and demographic answers manual,
         # even when someone accidentally puts them in the custom-answer JSON.
-        if re.search(r'clearance|citizen|sponsor|authoriz|eligib|export|itar|ear\b|veteran|disab|gender|race|ethnic|social security|ssn|birth|certif|agree|consent',label,re.I):
+        if requires_manual_answer(label):
             continue
         if isinstance(value,(str,int,float)) and fill(page,label,str(value)):filled.append(label)
     if resume:
@@ -79,19 +80,23 @@ def run(jid,resume,interactive=False,wait_for_session=False):
             page.wait_for_timeout(1000)
             if not interactive:
                 filled=fill_current(page,p,answers,resume)
-                report('Autofill complete — review in browser',filled=filled)
+                report('Autofill complete — review in browser',filled=filled,inspection=inspect_page(page,p,FIELDS,answers))
             else:
-                report('Ready — sign in / navigate, then click Fill current browser page')
+                report('Ready — sign in / navigate, then click Fill current browser page',inspection=inspect_page(page,p,FIELDS,answers))
             print('Sign in or register manually if needed. Review every answer and submit yourself.',flush=True)
             while browser.is_connected() and context.pages:
                 try:
                     if command.exists():
                         action=command.read_text(encoding='utf-8').strip();command.unlink(missing_ok=True)
                         if action=='close':break
-                        if action=='fill':
+                        if action in ('fill','inspect'):
                             current=context.pages[-1]
-                            filled=fill_current(current,profile(),json.loads(get_job(jid)['answers']),resume)
-                            report('Autofill complete — review in browser',filled=filled)
+                            applicant=profile();custom_answers=json.loads(get_job(jid)['answers'])
+                            if action=='fill':
+                                filled=fill_current(current,applicant,custom_answers,resume)
+                                report('Autofill complete — review in browser',filled=filled,inspection=inspect_page(current,applicant,FIELDS,custom_answers))
+                            else:
+                                report('Ready — form inspection complete',inspection=inspect_page(current,applicant,FIELDS,custom_answers))
                     save_state(context,job['url'])
                     status.touch()
                     context.pages[0].wait_for_timeout(1500)
