@@ -8,11 +8,13 @@ import streamlit as st
 from browser_sessions import state_path, session_key
 from db import ROOT, DATA, get_jobs
 from discovery import DEFAULT_SOURCES, clean_url
+from ui_workflows import render_credentials
+from credential_vault import browser_state_exists,forget_browser_state
 
 
 def render_accounts():
     st.subheader('Accounts & Sessions')
-    st.write('Open the employer portal, create an account or sign in yourself, and complete any MFA. The browser saves session cookies locally for later application windows. Accounts can be specific to an employer and portal; a saved session may expire or require another login.')
+    st.write('Save your application login below. Batch Launch uses it in the background and asks for help inside the dashboard when an account, verification or extra information is needed. You can still open a manual browser here as an optional fallback.')
     portals = {'Custom portal URL': ''}
     seen = set()
     for job in get_jobs():
@@ -24,7 +26,12 @@ def render_accounts():
         portals.update({url: url for url in DEFAULT_SOURCES})
     selected = st.selectbox('Employer portal', list(portals))
     url = st.text_input('Login / careers URL', value=portals[selected])
-    st.caption('Use the same portal hostname as the application when possible. Passwords are entered only in the employer browser. Saved cookies are credentials: keep data/account-sessions private. Discovery continues to use public pages, not account sessions.')
+    valid_url=None
+    try:
+        if url:valid_url=clean_url(url)
+    except ValueError:st.caption('Enter a complete https:// portal URL to configure its login.')
+    render_credentials(valid_url)
+    st.caption('Background batches save encrypted sessions in the private vault. The optional legacy manual-browser helper below still uses data/account-sessions. Discovery uses public pages, not your credentials.')
     task = st.session_state.get('account_task')
     active = task is not None and task['process'].poll() is None
     if st.button('Open portal to sign in / create account', disabled=active):
@@ -46,13 +53,14 @@ def render_accounts():
             with st.expander('Account browser log'):
                 st.code(task['log'].read_text(encoding='utf-8', errors='replace')[-6000:])
     try:
-        if url and state_path(clean_url(url)).exists():
+        if url and (state_path(clean_url(url)).exists() or browser_state_exists(clean_url(url))):
             st.success('A reusable session exists for this portal. This does not guarantee the employer still considers it signed in.')
             if st.button('Forget saved session', disabled=active):
                 # Acquire the same OS lock used by browser workers before deletion.
                 from browser_sessions import session_lock
                 with session_lock(url):
                     state_path(url).unlink(missing_ok=True)
+                    forget_browser_state(url)
                 st.success('Saved login session removed. This does not revoke the employer-side session.')
     except Exception as exc:
         if url:st.caption(str(exc))

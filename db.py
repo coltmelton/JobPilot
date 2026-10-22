@@ -35,6 +35,9 @@ def clear_job_queue():
     with closing(conn()) as c:
         c.execute('BEGIN IMMEDIATE')
         try:
+            if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'").fetchone():
+                if c.execute("SELECT 1 FROM workflow_runs WHERE state IN ('running','stopping')").fetchone():
+                    raise ValueError('Stop the active batch in Batch Launch before clearing the job queue.')
             jobs = [dict(row) for row in c.execute('SELECT * FROM jobs ORDER BY id')]
             if not jobs:
                 c.rollback()
@@ -44,6 +47,9 @@ def clear_job_queue():
             stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
             backup = folder / f'job-queue-{stamp}-{uuid4().hex[:8]}.json'
             backup.write_text(json.dumps({'created_at': datetime.now(timezone.utc).isoformat(), 'jobs': jobs}, indent=2), encoding='utf-8')
+            saved=c.execute("SELECT value FROM app_metadata WHERE key='job_id_highwater'").fetchone()
+            highwater=max(int(saved[0]) if saved else 0,max(job['id'] for job in jobs))
+            c.execute("INSERT OR REPLACE INTO app_metadata(key,value) VALUES('job_id_highwater',?)",(str(highwater),))
             c.execute('DELETE FROM jobs')
             c.execute("INSERT OR REPLACE INTO app_metadata(key,value) VALUES('queue_revision',?)", (uuid4().hex,))
             c.commit()
@@ -59,8 +65,15 @@ def get_job(job_id):
 
 def save_job(company,title,url,location=''):
     with closing(conn()) as c:
-        c.execute('INSERT OR IGNORE INTO jobs(company,title,url,location) VALUES(?,?,?,?)',(company,title,url,location));c.commit()
-        return c.execute('SELECT id FROM jobs WHERE url=?',(url,)).fetchone()[0]
+        c.execute('BEGIN IMMEDIATE')
+        existing=c.execute('SELECT id FROM jobs WHERE url=?',(url,)).fetchone()
+        if existing:
+            c.rollback();return existing[0]
+        saved=c.execute("SELECT value FROM app_metadata WHERE key='job_id_highwater'").fetchone()
+        next_id=max(int(saved[0]) if saved else 0,c.execute('SELECT COALESCE(MAX(id),0) FROM jobs').fetchone()[0])+1
+        c.execute('INSERT INTO jobs(id,company,title,url,location) VALUES(?,?,?,?,?)',(next_id,company,title,url,location))
+        c.execute("INSERT OR REPLACE INTO app_metadata(key,value) VALUES('job_id_highwater',?)",(str(next_id),));c.commit()
+        return next_id
 
 def update_job(job_id, **fields):
     allowed={'status','notes','answers','company','title','location','application_details'}

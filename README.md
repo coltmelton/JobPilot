@@ -5,6 +5,8 @@ A **local-first**, review-first Python dashboard for software-adjacent job appli
 ## Run
 
 Requires Python 3.10+ and a graphical desktop (Windows/macOS/Linux).
+The encrypted background batch workflow currently requires Windows; resume and
+discovery tools remain usable on other platforms.
 
 ### Windows quick start
 
@@ -43,10 +45,10 @@ Open the localhost URL Streamlit prints (usually http://localhost:8501).
 1. Complete My Profile; upload a resume in Documents.
 2. Open Resume & Matching, extract your resume text, and review your years of relevant experience. Set your self-reported clearance in My Profile.
 3. Use Discover Jobs to scan careers-page links and select postings to import, or copy an individual application link into Job Queue. Fetch full descriptions for reliable requirement checks.
-4. Use Accounts & Sessions to sign in manually if needed. Close that window before opening an application on the same portal.
+4. In Accounts & Sessions, save your shared email/password in the encrypted vault. Add portal-specific logins if needed.
 5. Go to Review & Launch, select the vacancy, and save any custom answers by the site's **exact field label** in the JSON editor. Keep screening certifications in manual answers.
-6. Select a resume and click **Open browser and autofill**. Sign in/navigate in the browser, then click **Fill current browser page** in JobPilot. Repeat after manually moving to another form page.
-7. Review every answer and attachment, personally submit, and update the job's status.
+6. In Batch Launch, choose jobs and a resume, optionally allow the shared login on those portals, then launch the batch. Jobs run one at a time in the background.
+7. Use the assistance inbox for missing information, login/account creation, verification and final review. Employer actions clicked there operate on the live website; a Submit action sends the application. The legacy visible-browser helper remains in Review & Launch as an optional alternative.
 
 ## Resume matching and account sessions
 
@@ -82,18 +84,26 @@ blocks reading, paste its text in Review & Launch. Select all applies only to
 the currently visible filtered results and preserves edits. Completed discovery
 results can be reloaded after a browser/session restart.
 
-Accounts & Sessions opens a browser for manual registration/login/MFA and saves
-cookies, local storage and IndexedDB under `data/account-sessions/`. Applications
-on the same portal reuse this state, subject to expiration and the employer's
-authentication rules. Passwords are not entered or stored by JobPilot. These
-session files are credentials and are excluded from git with the rest of `data/`.
-Use Forget saved session to delete the local state. Session-storage-only or
-device-bound authentication may require signing in again in each application.
+Accounts & Sessions stores shared and portal-specific credentials encrypted with
+Windows DPAPI under `%LOCALAPPDATA%\JobPilot\private`, outside the project and
+OneDrive. There is no plaintext/key-file fallback. They are decryptable by your
+Windows user, not portable project files. Shared credentials require permission
+for each portal (or the selected portals at batch launch); automatic login never
+sends a portal's password to a different iframe origin. Each job attempts saved
+login once, then asks for help rather than retrying repeatedly.
+
+Background batches save encrypted cookies/local storage/IndexedDB in that vault.
+Encrypted screenshot previews and encrypted assistance commands live in the local
+workflow database. Blank input values and passwords are not included in the
+persisted field metadata. The legacy manual-browser helper can still read/write
+older sessions in `data/account-sessions/`; Forget saved session deletes both the
+new encrypted state and legacy state. Session-storage-only or device-bound
+authentication may require another login or the optional manual browser.
 See [Playwright authentication](https://playwright.dev/python/docs/auth).
 
 Browser workers acquire an OS lock for their account session, released even if
-they crash. Batch workers wait their turn for the same portal; other portals can
-run concurrently. In Review & Launch, Fill current browser page deliberately
+they crash. Background batches run sequentially and surface a busy portal as an
+error if another helper has it open. In Review & Launch, Fill current browser page deliberately
 waits for your click after login/navigation and can be repeated. Final submission,
 dropdown certifications, citizenship, clearance and demographic answers remain
 manual, including when those questions were accidentally placed in custom JSON.
@@ -192,13 +202,13 @@ screening reference answers remain available for you to copy and review.
 
 Offline verification: `.venv\Scripts\python.exe -m unittest discover -v`.
 
-- **This is an MVP, not a universal application bot.** It discovers candidate postings from supported public boards, but does not automatically move through multi-page application forms, autonomously answer screening questions, or submit applications.
+- **This is an MVP, not a universal application bot.** Background batches fill known fields and advance unambiguous Apply/Next/Continue steps. Unknown controls, missing answers, account creation, MFA and final submission pause for your input.
 - The autofill helper fills only empty, visible, clearly labeled text fields, and uploads the selected resume only when exactly one file input exists. It will not fill dropdowns, government-related eligibility certifications, demographic questionnaires, or security clearance answers automatically.
 - Site-specific adapters are required for high success rates on Workday, Greenhouse, iCIMS, custom systems and other ATS platforms. They are **not yet implemented**.
-- An employer's site might block automation; respect access restrictions. Authentication, MFA, CAPTCHA and final submission are handled manually. The helper does not bypass any of these.
-- Close the account-login window before launching an application on the same portal. A second interactive worker reports the busy portal; batch workers wait for it.
+- An employer's site might block automation. CAPTCHA/passkey/device checks may need the optional manual browser, opened only when you request it. Restrictions are not bypassed.
+- Close the legacy account-login window before launching an application on that portal. A busy portal is reported in batch progress.
 - Records and uploads are stored **unencrypted** in `data/` locally. Do not expose Streamlit to the public internet or add sensitive identifiers, passwords or government ID data. Back up carefully.
-- Personal data is never submitted by this script (the browser helper does not click Submit). The external site does receive entered fields and uploads as part of interacting with its forms.
+- The external site receives entered fields and uploads while the form is being prepared. Final submission is only clicked through an explicit employer action you send from the inbox, never as an automatic batch step. An Applied status requires employer confirmation after your action.
 - On a dynamic site, the helper may miss fields or fill an unintended similarly labeled field. Always review before submission.
 
 ## Expansion plan
@@ -208,7 +218,7 @@ Offline verification: `.venv\Scripts\python.exe -m unittest discover -v`.
 3. Introduce an answer/required-document task queue, field-level confidence checks and optional LLM assistance without fabricating applicant claims.
 4. Extend local matching, add optional semantic analysis, tailored document drafts and richer submission confirmation tracking.
 
-## Concurrent batch application preparation
+## Background batch preparation and assistance inbox
 
 Use **Bulk Import** to paste many application links at once (one line per job):
 
@@ -217,8 +227,33 @@ Anduril | Software Engineer | https://example.com/real-job-link | CA
 Palantir | Backend Engineer | https://example.com/another-real-job-link | NY
 ```
 
-These URLs are **format examples only**, not actual vacancies. Then go to **Batch Launch**, select jobs, and choose 1–5 workers (recommended initial setting: 3). Jobs sharing the same employer portal use the saved account session sequentially; different portals can coexist. Sessions run until you close their windows, at which point the next queued browser opens. Per-job logs are in `data/logs/`. Legacy `data/browser-profiles/` directories are retained, but new windows use the saved account sessions instead; sign in again if needed.
+These URLs are **format examples only**, not actual vacancies. In **Batch Launch**,
+select jobs and your resume. Optional shared-login permission applies to those
+selected employer portals. Each job runs in a headless browser and the next starts
+after it is submitted, skipped, stopped or fails. Already-Applied jobs are skipped.
+The batch pauses while an application needs assistance; the sidebar displays an
+alert and an in-app toast, and the inbox refreshes automatically.
 
-Alternatively, run `python batch.py --job-ids 1,2,3 --workers 3 --resume resume.pdf` from the project folder.
+The inbox provides a masked employer-page preview, fields for text/password/code
+entry, native select and checkbox choices, saved-document uploads and visible
+employer action buttons. Changes are sent only when you press Send entries; choose
+an employer action separately, or Resume automation. Repeated experience/education
+sections and unfamiliar custom widgets may need these manual controls. Choose
+Skip to leave a job for review and continue the batch. Stop cancels queued work.
+After a crashed worker, End inactive batch becomes available after two minutes
+without a heartbeat. Queue reset is blocked while a batch remains active.
 
-**Important:** Batch Launch implements concurrent *preparation/autofill*, not autonomous multi-page applications or bulk submission. Discovery is a separate review-first workflow. Sites can impose rate limits, require manual logins, and prevent browser automation. The batch queue will not bypass these restrictions. Persisted browser profiles hold session cookies locally; protect the `data/` directory. Do not run more than one batch containing the *same job ID* at a time.
+Account-required alerts are based on the employer's explicit messages or detected
+registration forms. Ambiguous invalid credentials remain a login-help request;
+the app cannot determine every missing account in advance. It never creates an
+account or accepts agreements without the employer action/field choices you send.
+
+Batch status survives dashboard refreshes in `workflow_runs`/`workflow_tasks` in
+SQLite. A stopped/crashed browser's unsaved DOM edits are not recoverable. Relaunch
+unfinished jobs after resolving a stopped worker. Logs are in `data/logs/`.
+
+Alternatively, run `python batch.py --job-ids 1,2,3 --resume resume.pdf` and open the
+Batch Launch inbox to provide assistance. The supported worker count is one.
+
+Only one background batch can be active at a time. Legacy `data/browser-profiles/`
+directories are retained, but are not the new workflow's credential vault.

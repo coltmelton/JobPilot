@@ -11,6 +11,7 @@ from matching import assess_job, resume_fingerprint
 from ui_matching import render_resume, rank_and_filter, explain_candidates
 from ui_accounts import render_accounts
 from ui_job_analysis import description_controls
+from ui_workflows import render_batch,render_batch_notice
 
 st.set_page_config(page_title='JobPilot',page_icon='🧭',layout='wide')
 st.title('🧭 JobPilot')
@@ -22,6 +23,7 @@ if st.session_state.get('queue_revision')!=revision:
             del st.session_state[key]
     st.session_state['queue_revision']=revision
 page=st.sidebar.radio('Navigate',['Dashboard','Discover Jobs','Job Queue','Bulk Import','Resume & Matching','My Profile','Documents','Accounts & Sessions','Review & Launch','Batch Launch'])
+with st.sidebar:render_batch_notice()
 COMPANIES=['RTX / Raytheon','Anduril','Palantir','Lockheed Martin','Parker Hannifin','Parker Aerospace','KLA','Sartorius','Pfizer','Northrop Grumman']
 JOBS=get_jobs()
 if page=='Dashboard':
@@ -198,24 +200,7 @@ elif page=='Bulk Import':
         st.success(f'Processed {added} valid rows; duplicate URLs are ignored.')
         if errors:st.error(f'Invalid rows: {errors}')
 elif page=='Batch Launch':
-    st.subheader('Concurrent application preparation')
-    st.caption('Prepares applications in visible browser windows. Jobs on the same portal run one at a time to share your login safely; different portals can run concurrently. It does not submit or automatically advance through multi-step forms.')
-    if not JOBS:st.info('Import or add jobs first.')
-    else:
-        selections={f"#{j['id']} — {j['company']} — {j['title']}":j['id'] for j in JOBS}
-        selected=st.multiselect('Choose jobs to prepare',list(selections))
-        workers=st.slider('Concurrent browser sessions',min_value=1,max_value=5,value=3)
-        docs=list((DATA/'documents').glob('*')) if (DATA/'documents').exists() else []
-        chosen=st.selectbox('Resume for batch', ['None']+[f.name for f in docs])
-        st.warning('Launch only as many browser windows as your machine can handle. Verification, login, written questions, and final review may need your input in each window.')
-        if st.button('Launch selected applications',type='primary',disabled=not selected):
-            cmd=[sys.executable,str(ROOT/'batch.py'),'--job-ids',','.join(str(selections[s]) for s in selected),'--workers',str(workers)]
-            if chosen!='None':cmd+=['--resume',chosen]
-            try:
-                with (DATA/'batch.log').open('a',encoding='utf-8') as logfile:
-                    subprocess.Popen(cmd,cwd=ROOT,stdout=logfile,stderr=subprocess.STDOUT,start_new_session=True)
-                st.success(f'Started batch of {len(selected)} applications. Per-job logs: data/logs/')
-            except Exception as e:st.error(f'Unable to launch batch: {e}')
+    render_batch(JOBS)
 elif page=='Resume & Matching':
     render_resume()
 elif page=='Accounts & Sessions':
