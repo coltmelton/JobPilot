@@ -214,6 +214,12 @@ class WorkflowTests(unittest.TestCase):
         next(button for button in app.button if button.label=='Skip this job and continue batch').click().run()
         self.assertFalse(app.exception)
         self.assertEqual(store.pop_command(task['id'])['action'],'skip')
+        with patch('batch_control.batch_processes', return_value=[]):
+            next(button for button in app.button if button.label=='Force stop all batches').click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(store.get_run(rid)['state'], 'stopped')
+        self.assertEqual(store.get_task(task['id'])['state'], 'stopped')
+        with self.assertRaises(ValueError):store.send_command(task['id'],'resume')
 
     def test_browser_mirror_rejects_stale_page_and_supports_manual_checkbox(self):
         with real_playwright() as pw:

@@ -9,6 +9,7 @@ import streamlit as st
 
 import db
 import workflow_store as store
+from batch_control import force_stop_batches
 from credential_vault import credential_status, save_credentials, allow_shared, forget_credentials
 
 
@@ -44,6 +45,13 @@ def render_credentials(url=None, key='accounts'):
 
 def render_batch(jobs):
     st.subheader('Background application queue')
+    st.caption('Force stop immediately closes this project’s batch workers and their browser windows, including older batches. Unsaved employer form entries may be lost; submitted applications remain submitted.')
+    if st.button('Force stop all batches', key='force_stop_batches', type='primary'):
+        try:
+            force_stop_batches()
+            st.success('All JobPilot batches stopped. You can start a new batch.')
+        except Exception as exc:
+            st.error(f'Could not fully stop the batch: {exc}')
     st.write('Applications run one at a time without opening Chrome windows. The batch fills supported fields and advances supported steps, then pauses here for login, account creation, verification, missing answers or final review.')
     if jobs:
         candidates=[job for job in jobs if job['status']!='Applied']

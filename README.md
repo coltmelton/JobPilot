@@ -257,3 +257,7 @@ Batch Launch inbox to provide assistance. The supported worker count is one.
 
 Only one background batch can be active at a time. Legacy `data/browser-profiles/`
 directories are retained, but are not the new workflow's credential vault.
+
+## Stopping a batch
+
+Open **Batch Launch** and click **Force stop all batches** to immediately close this project's batch workers and their browser processes, including older batches. The app stays open. Unfinished tasks are marked stopped and queued commands are cleared; you can launch a new batch. Unsaved employer form entries may be lost. Applications already submitted remain submitted. **Stop this batch** in the inbox requests a normal stop instead.
