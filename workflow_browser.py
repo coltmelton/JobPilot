@@ -19,12 +19,12 @@ DOM = r'''prefix => {
     Array.from(el.labels || []).map(text).join(' ') ||
     text(el.closest('[data-automation-id^="formField"],.form-group')?.querySelector('label')) ||
     el.getAttribute('placeholder') || el.name || 'Unlabelled field';
-  const fields = Array.from(document.querySelectorAll('input,textarea,select,[role="combobox"],[role="checkbox"],[role="radio"],button[aria-haspopup="listbox"]'))
+  const fields = Array.from(document.querySelectorAll('input,textarea,select,[contenteditable="true"],[role="textbox"],[role="combobox"],[role="checkbox"],[role="radio"],button[aria-haspopup="listbox"]'))
     .filter(el => (visible(el) || el.type === 'file') && (!['hidden','submit','button','reset','image'].includes(el.type) || el.getAttribute('aria-haspopup') === 'listbox'))
     .slice(0,100).map((el,index) => {
       const id = prefix+'-f'+index;
       el.setAttribute('data-jobpilot-control',id);
-      const type = (el.tagName === 'SELECT' ? 'select' : el.getAttribute('aria-haspopup') === 'listbox' ? 'combobox' : el.getAttribute('role') || el.getAttribute('type') || (el.tagName === 'TEXTAREA' ? 'textarea' : 'text')).toLowerCase();
+      const type = (el.isContentEditable ? 'textarea' : el.tagName === 'SELECT' ? 'select' : el.getAttribute('aria-haspopup') === 'listbox' ? 'combobox' : el.getAttribute('role') === 'textbox' ? 'text' : el.getAttribute('role') || el.getAttribute('type') || (el.tagName === 'TEXTAREA' ? 'textarea' : 'text')).toLowerCase();
       let populated = type === 'password' ? null : type === 'file' ? !!el.files?.length :
         ['checkbox','radio'].includes(type) ? (el.checked ?? el.getAttribute('aria-checked') === 'true') :
         type === 'combobox' && el.tagName !== 'INPUT' ? !!text(el).trim() :
@@ -33,6 +33,9 @@ DOM = r'''prefix => {
       if (type === 'combobox' && /^[\s\-–]*(?:select|choose|please select)/i.test(el.tagName === 'INPUT' ? el.value : text(el))) populated=false;
       if (type === 'radio' && el.name) populated = Array.from(document.querySelectorAll('input[type="radio"]')).some(other => other.name === el.name && other.form === el.form && other.checked);
       return {id,label:label(el).slice(0,180),type,populated,
+        hint:[el.name || '',el.id || ''].join(' ').slice(0,180),
+        section:text(el.closest('fieldset,section')?.querySelector('legend,h2,h3')).slice(0,160),
+        form:el.form ? 'form-'+Array.from(document.forms).indexOf(el.form) : '',
         autocomplete:el.getAttribute('autocomplete') || '',
         required:!!el.required || el.getAttribute('aria-required') === 'true',
         disabled:!!el.disabled || el.getAttribute('aria-disabled') === 'true',readonly:!!el.readOnly,
@@ -46,7 +49,7 @@ DOM = r'''prefix => {
       (el.tagName !== 'A' || /apply|sign.?in|log.?in|create.*account|register|next|continue|application|autofill|upload.*(?:resume|cv)|without autofill|manually/i.test(label)))
     .slice(0,70).map(({el,label},index) => {
       const id=prefix+'-a'+index;el.setAttribute('data-jobpilot-action',id);
-      return {id,label,role:el.getAttribute('role') || 'button',destination:el.tagName === 'A' ? el.href : ''};
+      return {id,label,role:el.getAttribute('role') || 'button',form:el.form ? 'form-'+Array.from(document.forms).indexOf(el.form) : '',destination:el.tagName === 'A' ? el.href : ''};
     });
   const error_count = Array.from(document.querySelectorAll('[role="alert"],.error-message,[data-automation-id="errorMessage"]')).filter(el => visible(el) && text(el)).length;
   return {fields,actions,error_count};

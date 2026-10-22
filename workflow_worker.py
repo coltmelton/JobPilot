@@ -8,7 +8,8 @@ from urllib.parse import urlsplit
 import db
 import workflow_store as store
 from form_intelligence import (fill_supported, next_step, blocking_fields, remember_answers,
-                               review_page, entry_step, click_entry, choose_resume, RESUME_METHOD, UPLOAD_RESUME)
+                               review_page, entry_step, click_entry, choose_resume, RESUME_METHOD, UPLOAD_RESUME, unanswered_text_fields)
+from resume_upload import upload_blocked, mark_result, is_resume_field
 from browser_sessions import session_lock
 from credential_vault import get_credentials, load_browser_state, save_browser_state
 from workflow_browser import (capture, preview, page_state, action_named, click_action,
@@ -36,6 +37,11 @@ def login_stage(page, view):
     return (page.url, tuple((f['label'], f['type']) for f in view['fields'] if not f['disabled']))
 
 
+def optional_signature(page,view):
+    return (page.url,tuple(page.locator('h1,h2,[role="heading"]').all_text_contents()),
+            tuple((f['frame'],f['label'],f['type']) for f in view['fields']))
+
+
 def run_task(task, resume=''):
     from playwright.sync_api import sync_playwright
     task_id, run_id = task['id'], task['run_id']
@@ -56,6 +62,8 @@ def run_task(task, resume=''):
             steps = 0
             visited = {}
             entry_attempts = {}
+            upload_state = {}
+            optional_skip = None
             view = None
             current_state = 'running'
 
@@ -70,6 +78,7 @@ def run_task(task, resume=''):
                 nonlocal view, current_state
                 page = current_page()
                 view = capture(page)
+                view['resume_upload']=dict(upload_state)
                 try:image = preview(page)
                 except Exception:image = b''
                 current_state = state
@@ -115,6 +124,7 @@ def run_task(task, resume=''):
                                 publish('manual_browser');paused=True;continue
                             if action == 'fields':
                                 apply_changes(page, view, command.get('changes', {}), db.DATA/'documents')
+                                mark_result(page,resume,upload_state)
                                 if command.get('remember'):remember_answers(view,command.get('changes', {}))
                                 # Complete routine pages immediately after receiving the missing answer.
                                 if current_state == 'needs_information':
@@ -131,6 +141,10 @@ def run_task(task, resume=''):
                                 page.wait_for_timeout(1200)
                             elif action == 'retry_login':
                                 attempted_login=None
+                            elif action == 'continue_optional':
+                                optional_skip=optional_signature(page,view)
+                            elif action == 'retry_upload':
+                                upload_state.clear()
                             elif action not in ('resume','fields'):
                                 raise ValueError('Unsupported command')
                             paused=False;visited.clear();entry_attempts.clear();steps=0
@@ -167,10 +181,13 @@ def run_task(task, resume=''):
                     db.update_job(job['id'], status='In progress')
                     applicant = db.profile()
                     current_job = db.get_job(job['id'])
+                    resume = choose_resume(resume,applicant,db.DATA/'documents')
+                    filled = fill_supported(page,applicant,json.loads(current_job['answers']),resume,db.DATA/'documents',upload_state)
+                    view=capture(page)
                     if review_page(page):
                         publish('review_ready');paused=True;continue
-                    resume = choose_resume(resume,applicant,db.DATA/'documents')
-                    entry = entry_step(view)
+                    resume_blocked=upload_blocked(page,resume,upload_state)
+                    entry = entry_step(view,resume_available=not resume_blocked)
                     if entry:
                         entry_key=(page.url,entry['frame'],entry['label'])
                         if entry_attempts.get(entry_key,0)<2:
@@ -178,31 +195,38 @@ def run_task(task, resume=''):
                             if needs_resume and not resume:
                                 publish('needs_information','This site offers resume autofill. Save a resume in Documents and select it in Batch Launch; if several resumes exist, choose the right one and relaunch this batch.');paused=True;continue
                             if needs_resume and any(f['type']=='file' for f in view['fields']):
-                                fill_supported(page,applicant,json.loads(current_job['answers']),resume,db.DATA/'documents')
+                                fill_supported(page,applicant,json.loads(current_job['answers']),resume,db.DATA/'documents',upload_state)
                                 view=capture(page)
                                 entry=entry_step(view)
                                 if not entry:continue
                             entry_attempts[entry_key]=entry_attempts.get(entry_key,0)+1
                             store.update_task(task_id,'running','Selecting resume autofill and opening its upload step.' if needs_resume else 'Opening the application from the introductory Apply button.')
-                            try:click_entry(page,view,entry,resume,db.DATA/'documents')
+                            try:click_entry(page,view,entry,resume,db.DATA/'documents',upload_state)
                             except Exception:
                                 page.wait_for_timeout(1000);continue
                             page.wait_for_timeout(1200);continue
-                    filled = fill_supported(page,applicant,json.loads(current_job['answers']),resume,db.DATA/'documents')
                     view = capture(page)
                     final = action_named(view, r'submit(?: application)?|send application|finish(?: application)?|review and submit')
                     if final or review_page(page):
                         publish('review_ready');paused=True;continue
                     missing = blocking_fields(view)
+                    if upload_state.get('status')=='attached':
+                        missing=[f for f in missing if not (f['type']=='file' and is_resume_field(f,view['fields']))]
                     if missing:
                         # Dependent country/state widgets often appear only after blur.
                         page.wait_for_timeout(700)
-                        filled += fill_supported(page,applicant,json.loads(current_job['answers']),resume,db.DATA/'documents')
+                        filled += fill_supported(page,applicant,json.loads(current_job['answers']),resume,db.DATA/'documents',upload_state)
                         view=capture(page);missing=blocking_fields(view)
+                        if upload_state.get('status')=='attached':
+                            missing=[f for f in missing if not (f['type']=='file' and is_resume_field(f,view['fields']))]
                     if missing:
                         labels=', '.join(dict.fromkeys(f['label'] for f in missing))
                         publish('needs_information', f'Filled {len(filled)} supported field(s). Still needs your answer: {labels[:400]}. Send these entries here; routine steps then resume automatically.');paused=True;continue
-                    button = next_step(view)
+                    optional=[f for f in unanswered_text_fields(view) if not f['required']]
+                    if optional and optional_signature(page,view)!=optional_skip:
+                        labels=', '.join(dict.fromkeys(f['label'] for f in optional))
+                        publish('needs_information',f'These text fields have no known answer: {labels[:400]}. Enter the missing information, or choose to leave the remaining optional fields blank and continue.');paused=True;continue
+                    button = next_step(view,prefer_save=bool(filled))
                     signature = progress_signature(page, view)
                     if not button:
                         attempts=visited.get(signature,0)

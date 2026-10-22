@@ -141,6 +141,12 @@ def render_inbox():
     view=json.loads(task['snapshot'] or '{}')
     st.write(task['message'])
     if not view:return
+    if task['state']=='needs_information':
+        if st.button('Leave remaining optional fields blank and continue',key=f"optional_{task['id']}"):_send(task,view,'continue_optional')
+        if view.get('resume_upload',{}).get('status')=='attempted':
+            st.caption('A resume upload was attempted, but acceptance could not be confirmed. Automatic repeat uploads are blocked.')
+        if view.get('resume_upload',{}).get('status'):
+            if st.button('Retry resume upload if the previous upload failed',key=f"retry_upload_{task['id']}"):_send(task,view,'retry_upload')
     st.caption('Employer page: '+view['url'])
     try:
         image=store.screenshot_bytes(task['id'])

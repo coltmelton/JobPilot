@@ -10,6 +10,7 @@ import db
 from form_intelligence import (fill_supported, value_for, next_step, blocking_fields, remember_answers,
                                review_page, entry_step, choose_resume, click_entry)
 from workflow_browser import capture
+from resume_upload import upload_blocked, attachment_present
 
 
 class IntelligenceTests(unittest.TestCase):
@@ -143,3 +144,64 @@ class IntelligenceTests(unittest.TestCase):
         self.assertTrue(blocking_fields(capture(self.page)))
         fill_supported(self.page,{'country':'US'},{},'',self.documents)
         self.assertFalse(blocking_fields(capture(self.page)))
+
+    def test_text_and_dynamic_fields_filled_before_resume_upload(self):
+        (self.documents/'resume.txt').write_text('Resume')
+        self.page.set_content('''<label>Resume<input type="file" onchange="document.body.dataset.complete=(document.querySelector('#first').value==='Example' && document.querySelector('#last')?.value==='Applicant')?'yes':'no'"></label>
+            <label>First Name<input id="first" onblur="if(!document.querySelector('#last'))setTimeout(()=>document.querySelector('#later').innerHTML='<label>Last Name<input id=last></label>',250)"></label><div id="later"></div>''')
+        fill_supported(self.page,{'first_name':'Example','last_name':'Applicant'},{},'resume.txt',self.documents)
+        self.assertEqual(self.page.locator('body').get_attribute('data-complete'),'yes')
+
+    def test_resume_uploaded_once_when_widgets_reset_and_reappear(self):
+        (self.documents/'resume.txt').write_text('Resume')
+        self.page.set_content('''<script>window.uploads=0</script><label>Resume<input type="file" onchange="window.uploads++;this.value=''"></label><label>Additional Resume<input type="file" onchange="window.uploads++;this.value=''"></label>''')
+        state={}
+        fill_supported(self.page,{}, {},'resume.txt',self.documents,state)
+        fill_supported(self.page,{}, {},'resume.txt',self.documents,state)
+        self.assertEqual(self.page.evaluate('window.uploads'),1)
+        self.assertEqual(state['status'],'attempted')
+        self.page.set_content('<label>Resume<input type="file" onchange="document.body.dataset.duplicate=\'yes\'"></label>')
+        fill_supported(self.page,{}, {},'resume.txt',self.documents,state)
+        self.assertIsNone(self.page.locator('body').get_attribute('data-duplicate'))
+
+    def test_existing_server_attachment_prevents_upload_even_with_empty_input(self):
+        (self.documents/'resume.txt').write_text('Resume')
+        self.page.set_content('''<div class="attachment">resume.txt <button>Remove</button></div><label>Resume<input type="file" onchange="document.body.dataset.duplicate='yes'"></label>''')
+        self.assertTrue(attachment_present(self.page,'resume.txt'))
+        state={};fill_supported(self.page,{}, {},'resume.txt',self.documents,state)
+        self.assertEqual(state['status'],'attached')
+        self.assertIsNone(self.page.locator('body').get_attribute('data-duplicate'))
+
+    def test_filename_in_upload_instruction_is_not_an_existing_attachment(self):
+        self.page.set_content('<p>Please upload resume.txt</p><label>Resume<input type="file"></label>')
+        self.assertFalse(attachment_present(self.page,'resume.txt'))
+
+    def test_existing_different_resume_is_kept_but_cover_letter_is_not_a_resume(self):
+        self.page.set_content('<fieldset><legend>Resume</legend><div class="attachment">previous-version.pdf <button>Remove</button></div></fieldset>')
+        self.assertTrue(attachment_present(self.page,'resume.txt'))
+        self.page.set_content('<div data-automation-id="formField-resume"><div data-automation-id="uploaded-file">previous-version.pdf</div></div>')
+        self.assertTrue(attachment_present(self.page,'resume.txt'))
+        self.page.set_content('<fieldset><legend>Cover letter</legend><div class="attachment"><span>resume.txt</span><button>Remove</button></div></fieldset>')
+        self.assertFalse(attachment_present(self.page,'resume.txt'))
+
+    def test_new_optional_fields_and_rich_text_are_filled(self):
+        self.page.set_content('''<input name="first_name"><input name="emailAddress"><div role="textbox" aria-label="Professional summary" contenteditable="true"></div><label>Languages<textarea></textarea></label>''')
+        fill_supported(self.page,{'first_name':'Example','email':'candidate@example.test','professional_summary':'Engineer with Python experience','languages':'English'},{},'',self.documents)
+        self.assertEqual(self.page.locator('[name="first_name"]').input_value(),'Example')
+        self.assertEqual(self.page.locator('[name="emailAddress"]').input_value(),'candidate@example.test')
+        self.assertEqual(self.page.get_by_label('Professional summary').inner_text(),'Engineer with Python experience')
+        self.assertEqual(self.page.get_by_label('Languages').input_value(),'English')
+
+    def test_save_continue_wording_and_form_scope(self):
+        for wording in ('Save and Next','Save + Continue','Continue to Education','Next: Work Experience','Proceed','Save Changes','Review application','Save and Go to Next Step','Continue to Background Check','Next (Education)','Go to next step','Save & Continue >'):
+            with self.subTest(wording=wording):
+                self.page.set_content('<form><label>Email<input></label><button>'+wording+'</button></form>')
+                self.assertEqual(next_step(capture(self.page))['label'],wording)
+        self.page.set_content('<button>Next</button><form><label>Email<input></label><button>Next</button></form>')
+        self.assertEqual(next_step(capture(self.page))['form'],'form-0')
+        for wording in ('Save and Submit','Save and Exit','Continue to Submit','Finish application'):
+            self.page.set_content('<label>Email<input></label><button>'+wording+'</button>')
+            self.assertIsNone(next_step(capture(self.page)))
+        self.page.set_content('<form><label>Email<input></label><button>Save Changes</button><button>Next</button></form>')
+        self.assertEqual(next_step(capture(self.page),prefer_save=True)['label'],'Save Changes')
+        self.assertEqual(next_step(capture(self.page))['label'],'Next')

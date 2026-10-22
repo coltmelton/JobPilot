@@ -250,6 +250,50 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(store.tasks(rid)[0]['state'],'skipped')
         self.assertTrue(any('resume' in message.lower() for message in messages))
 
+    def test_text_completion_save_continue_and_repeated_resume_widgets(self):
+        folder=self.root/'documents';folder.mkdir()
+        (folder/'resume.txt').write_text('Test resume',encoding='utf-8')
+        original_handler=self.fixture_handler;original_operator=self.operator
+        uploads=[];asked=[]
+        def handler(route):
+            path=route.request.url.split('fixture.test')[-1]
+            if path=='/form':
+                body='''<h1>Personal information</h1><form>
+                    <label>Resume<input type="file" onchange="sessionStorage.uploads=String(Number(sessionStorage.uploads||0)+1);document.querySelector('#attachment').textContent='resume.txt';this.value=''"></label><div class="attachment" id="attachment"></div>
+                    <label>First Name<input required></label><label>Portfolio description<textarea></textarea></label>
+                    <button type="button" onclick="if(this.form.reportValidity() && document.querySelector('textarea').value)location.href='/second?uploads='+sessionStorage.uploads">Save and Continue</button></form>'''
+            elif path.startswith('/second'):
+                uploads.append(path)
+                body='''<h1>Additional information</h1><div class="attachment">resume.txt <button>Remove</button></div><form>
+                    <label>Resume<input type="file" onchange="location.href='/duplicate'"></label><label>Email<input required></label><button type="button" onclick="if(this.form.reportValidity())location.href='/review'">Next: Review</button></form>'''
+            else:original_handler(route);return
+            route.fulfill(content_type='text/html',body=body)
+        def operator(task_id,state,message,snapshot=None,screenshot=None):
+            if state=='needs_information' and snapshot and snapshot['url'].endswith('/form'):
+                self.original_update(task_id,state,message,snapshot,screenshot)
+                asked.append(message)
+                field=next(f for f in snapshot['fields'] if f['label']=='Portfolio description')
+                store.send_command(task_id,'fields',snapshot['view_id'],changes={field['id']:'My supplied project description'})
+            else:original_operator(task_id,state,message,snapshot,screenshot)
+        self.fixture_handler=handler;self.operator=operator
+        self.drive()
+        self.assertEqual(uploads,['/second?uploads=1'])
+        self.assertEqual(len(asked),1)
+
+    def test_separate_save_then_continue_controls(self):
+        original=self.fixture_handler;saved=[]
+        def handler(route):
+            path=route.request.url.split('fixture.test')[-1]
+            if path=='/form':
+                route.fulfill(content_type='text/html',body='''<h1>Contact details</h1><form><label>First Name<input required></label><button type="button" onclick="sessionStorage.saved=document.querySelector('input').value">Save Changes</button><button type="button" onclick="location.href='/saved?name='+encodeURIComponent(sessionStorage.saved||'')">Continue to next page</button></form>''')
+            elif path.startswith('/saved'):
+                saved.append(path)
+                route.fulfill(content_type='text/html',body='''<h1>Review application</h1><button onclick="location.href='/done'">Submit application</button>''')
+            else:original(route)
+        self.fixture_handler=handler
+        self.drive()
+        self.assertEqual(saved,['/saved?name=Example'])
+
     def test_missing_account_registration_and_verification_stay_in_app(self):
         self.drive(missing_account=True)
         self.assertIn('account_required',self.events)

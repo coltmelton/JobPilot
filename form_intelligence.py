@@ -7,6 +7,7 @@ from pathlib import Path
 from autofill import FIELDS
 from form_inspection import normalize_label, requires_manual_answer
 from workflow_browser import _control, capture
+from resume_upload import upload_blocked, mark_attempt, mark_result, is_resume_field
 
 
 EXTRA_ALIASES = {
@@ -23,6 +24,10 @@ EXTRA_ALIASES = {
     'skills': ['technical skills', 'technical skills / tools'],
     'professional_summary': ['professional summary'],
     'available_start': ['available start date', 'notice period'],
+    'languages': ['languages', 'languages spoken'],
+    'technical_example': ['technical accomplishment', 'technical accomplishment example'],
+    'teamwork_example': ['teamwork example', 'leadership example'],
+    'defense_motivation': ['why defense / aerospace?', 'why defense?', 'why aerospace?'],
 }
 AUTOCOMPLETE = {'given-name':'first_name', 'family-name':'last_name', 'additional-name':'middle_name',
                 'email':'email', 'tel':'phone', 'address-line1':'address_line1',
@@ -42,24 +47,34 @@ STATES = dict(pair.split(':') for pair in (
 
 
 def key_for(field):
-    label = normalize_label(re.sub(r'\s*\(required\)\s*$', '', normalize_label(field['label']), flags=re.I))
+    raw=re.sub(r'([a-z])([A-Z])',r'\1 \2',field['label']).replace('_',' ')
+    label = normalize_label(re.sub(r'\s*\(required\)\s*$', '', normalize_label(raw), flags=re.I))
     aliases = {normalize_label(label):key for key, labels in FIELDS.items() for label in labels}
     aliases.update({normalize_label(label):key for key, labels in EXTRA_ALIASES.items() for label in labels})
     key = aliases.get(label)
     if key:return key
+    simple=re.sub(r'^(?:please enter |enter |your )','',label)
+    if simple in aliases:return aliases[simple]
+    if label in ('unlabelled field','type here','enter text'):
+        compact={re.sub(r'[^a-z0-9]','',name):key for name,key in aliases.items()}
+        for hint in field.get('hint','').split():
+            name=re.sub(r'[^a-z0-9]','',hint.casefold())
+            if name in compact:return compact[name]
     tokens = field.get('autocomplete', '').split()
     return AUTOCOMPLETE.get(tokens[-1]) if tokens else None
 
 
 def reusable(field):
-    return (field['type'] in ('text','textarea','email','tel','url','select','combobox','number')
+    return (field['type'] in ('text','textarea','email','tel','url','select','combobox','number','date')
             and not requires_manual_answer(field['label'])
             and not re.search(r'verification|one.time|passcode|otp|token|security|signature|initials|date of|salary|compensation|\bage\b',field['label'],re.I)
-            and normalize_label(field['label']) != 'unlabelled field')
+            and (normalize_label(field['label']) != 'unlabelled field' or key_for(field)))
 
 
 def value_for(field, applicant, answers):
     if not reusable(field):return None, None
+    section=field.get('section','').casefold()
+    if re.search(r'reference|emergency contact|supervisor',section):return None,None
     key = key_for(field)
     if key and applicant.get(key) not in (None, ''):return str(applicant[key]), key
     label = normalize_label(field['label'])
@@ -73,6 +88,13 @@ def value_for(field, applicant, answers):
         if phone.startswith('+1'):return '+1', 'phone_code'
         country = normalize_label(str(applicant.get('country','')))
         if COUNTRIES.get(country, country) in ('united states','canada'):return '+1', 'phone_code'
+    histories=[('education',r'education|academic',{'school':'School','school name':'School','university':'School','degree':'Degree','major':'Major','field of study':'Major'}),
+               ('employment',r'employment|work experience',{'employer':'Employer','company name':'Employer','job title':'Title','title':'Title','responsibilities':'Responsibilities / accomplishments','reason for leaving':'Reason for leaving'})]
+    for history,pattern,columns in histories:
+        rows=applicant.get(history,[])
+        if re.search(pattern,section) and len(rows)==1 and label in columns:
+            value=rows[0].get(columns[label],'')
+            if value:return str(value),None
     return None, None
 
 
@@ -111,12 +133,12 @@ UPLOAD_RESUME = r'upload (?:a |your |my )?(?:resume|résumé|cv)'
 APPLY_ENTRY = r'apply|apply now|apply for (?:this )?(?:job|position)|start application|begin application'
 
 
-def entry_step(view):
+def entry_step(view, resume_available=True):
     """Ignore search filters on postings, but never treat a populated form as a posting."""
     methods=[a for a in view['actions'] if re.fullmatch(RESUME_METHOD,normalize_label(a['label']))]
-    if methods:return methods[0]
+    if methods and resume_available:return methods[0]
     uploads=[a for a in view['actions'] if re.fullmatch(UPLOAD_RESUME,normalize_label(a['label']))]
-    if uploads and not any(f['type']=='file' for f in view['fields']):return uploads[0]
+    if uploads and resume_available and not any(f['type']=='file' for f in view['fields']):return uploads[0]
     relevant=[f for f in view['fields'] if not f['disabled'] and not (
         f['type']=='search' or re.search(r'search|keyword|filter|job location',f['label'],re.I))]
     if relevant:return None
@@ -125,15 +147,19 @@ def entry_step(view):
     return choices[0] if len(choices)==1 or same_target else None
 
 
-def click_entry(page,view,action,resume,documents):
+def click_entry(page,view,action,resume,documents,upload_state=None):
+    upload_state={} if upload_state is None else upload_state
     locator=_control(page,view,action)
     if re.fullmatch(UPLOAD_RESUME,normalize_label(action['label'])):
+        if upload_blocked(page,resume,upload_state):return
         path=(Path(documents)/resume).resolve()
         if path.parent != Path(documents).resolve() or not path.is_file():raise ValueError('Select a saved resume first.')
         with page.expect_file_chooser(timeout=4000) as chooser:
             locator.click(timeout=4000)
+        mark_attempt(upload_state)
         chooser.value.set_files(str(path))
         wait_for_upload(page)
+        mark_result(page,resume,upload_state)
     else:locator.click(timeout=10000)
 
 
@@ -176,53 +202,82 @@ def select_combobox(page,view,field,value,key,applicant):
         page.wait_for_timeout(200)
 
 
-def fill_supported(page, applicant, answers, resume, documents):
-    """Re-inspect between controls; one changed widget must not invalidate all filling."""
+def field_identity(field):
+    return tuple(field.get(key,'') for key in ('frame','label','type','hint','section'))
+
+
+def fill_supported(page, applicant, answers, resume, documents, upload_state=None):
+    """Finish text passes before uploading, then revisit fields changed by resume parsing."""
+    upload_state={} if upload_state is None else upload_state
     filled = []
-    initial = capture(page)
-    identities = [(f['frame'], f['label'], f['type']) for f in initial['fields']]
-    for identity in dict.fromkeys(identities):
-        view = capture(page)
-        matches = [f for f in view['fields'] if (f['frame'],f['label'],f['type']) == identity]
-        if len(matches) != 1:continue
-        field = matches[0]
-        if field['disabled'] or (field['readonly'] and field['type']!='combobox') or field['populated']:continue
-        try:
-            locator = _control(page,view,field)
-            if field['type'] == 'file':
-                uploads = [f for f in view['fields'] if f['type']=='file']
-                is_resume = re.search(r'resume|curriculum vitae|\bcv\b',field['label'],re.I)
-                other_doc = re.search(r'cover|letter|transcript|certificate',field['label'],re.I)
-                path = (Path(documents) / resume).resolve() if resume else None
-                if path and path.parent == Path(documents).resolve() and path.is_file() and not other_doc and (is_resume or len(uploads)==1):
-                    locator.set_input_files(str(path),timeout=2500);wait_for_upload(page);filled.append(field['label'])
-                continue
-            value, key = value_for(field,applicant,answers)
-            if value is None:continue
-            if field['type'] == 'select':
-                options = option_matches([o for o in field['options'] if not o['disabled']],value,key,applicant,lambda o:o['label'])
-                if len(options) != 1:continue
-                locator.select_option(index=options[0]['index'],timeout=2500)
-            elif field['type'] == 'combobox':
-                if not select_combobox(page,view,field,value,key,applicant):continue
-            else:
-                locator.fill(value,timeout=2500)
-                locator.press('Tab',timeout=1000)
-            filled.append(field['label'])
-        except Exception:
-            # Widgets can re-render each other. Re-inspect the remaining fields.
-            continue
+    for phase in ('text','upload','text'):
+        phase_start=len(filled)
+        for round_number in range(1 if phase=='upload' else 3):
+            before=len(filled)
+            initial=capture(page)
+            identities=[field_identity(f) for f in initial['fields'] if (f['type']=='file')==(phase=='upload')]
+            for identity in dict.fromkeys(identities):
+                view=capture(page)
+                matches=[f for f in view['fields'] if field_identity(f)==identity]
+                if len(matches)!=1:continue
+                field=matches[0]
+                if field['disabled'] or (field['readonly'] and field['type']!='combobox') or field['populated']:continue
+                try:
+                    locator=_control(page,view,field)
+                    if phase=='upload':
+                        if not resume or not is_resume_field(field,view['fields']) or upload_blocked(page,resume,upload_state):continue
+                        path=(Path(documents)/resume).resolve()
+                        if path.parent!=Path(documents).resolve() or not path.is_file():continue
+                        mark_attempt(upload_state)
+                        locator.set_input_files(str(path),timeout=2500)
+                        wait_for_upload(page);mark_result(page,resume,upload_state)
+                    else:
+                        value,key=value_for(field,applicant,answers)
+                        if value is None:continue
+                        if field['type']=='select':
+                            options=option_matches([o for o in field['options'] if not o['disabled']],value,key,applicant,lambda o:o['label'])
+                            if len(options)!=1:continue
+                            locator.select_option(index=options[0]['index'],timeout=2500)
+                        elif field['type']=='combobox':
+                            if not select_combobox(page,view,field,value,key,applicant):continue
+                        else:
+                            locator.fill(value,timeout=2500);locator.press('Tab',timeout=1000)
+                    filled.append(field['label'])
+                except Exception:
+                    continue
+            if len(filled)==before:
+                if phase=='text' and round_number<2 and identities and len(filled)>phase_start:
+                    page.wait_for_timeout(300);continue
+                break
+            if phase=='text':page.wait_for_timeout(150)
     return filled
 
 
-def next_step(view):
+def next_step(view, prefer_save=False):
     resume_offered=any(re.fullmatch(RESUME_METHOD,normalize_label(a['label'])) for a in view['actions'])
-    patterns = (r'apply|apply now|apply for (?:this )?(?:job|position)|apply manually|apply without autofill|start application|begin application',) if not view['fields'] and not resume_offered else (
-        r'(?:save\s*(?:and|&)\s*)?(?:next|continue)(?:\s+(?:application|step|to (?:next step|application|review)))?',)
+    patterns = (
+        r'save\s*(?:and|&|\+)\s*(?:go to )?(?:next|continue|proceed)(?:\s+(?:step|page|application|to .+))?',
+        r'(?:go to )?(?:next|continue|proceed)(?:\s+(?:step|page|application)|\s+to .+|\s*[:–-]\s*.+|\s*\([^()]{1,80}\))?',
+        r'(?:review|review (?:your )?application|save (?:and|&) review)',
+        r'save(?: changes| progress)?',
+    )
+    if prefer_save:patterns=(r'save(?: changes| progress)?',)+patterns
+    if not view['fields'] and not resume_offered:
+        patterns+=(r'apply|apply now|apply for (?:this )?(?:job|position)|apply manually|apply without autofill|start application|begin application',)
+    field_forms={(f['frame'],f.get('form')) for f in view['fields'] if f.get('form') and f['type']!='search'}
     for pattern in patterns:
-        candidates = [a for a in view['actions'] if re.fullmatch(pattern,normalize_label(a['label']))]
+        candidates = [a for a in view['actions'] if not re.search(r'\b(?:submit|finish|send|exit|later|cancel|back|return)\b|complete application',a['label'],re.I) and re.fullmatch(pattern,normalize_label(a['label']).strip(' →›»>'))]
+        scoped=[a for a in candidates if (a['frame'],a.get('form')) in field_forms]
+        if scoped:candidates=scoped
         if len(candidates)==1:return candidates[0]
+        if candidates and candidates[0].get('form') and len({(a['frame'],a.get('form'),normalize_label(a['label'])) for a in candidates})==1:return candidates[0]
     return None
+
+
+def unanswered_text_fields(view):
+    return [f for f in view['fields'] if f['type'] in ('text','textarea','email','tel','url','number','date')
+            and not f['populated'] and not f['disabled'] and not f['readonly']
+            and not re.search(r'search|keyword|filter',f['label'],re.I)]
 
 
 def blocking_fields(view):
