@@ -1,5 +1,7 @@
 """Evidence-based form decisions using profile facts and explicitly remembered answers."""
+import json
 import re
+import time
 from pathlib import Path
 
 from autofill import FIELDS
@@ -91,6 +93,89 @@ def option_matches(options, value, key, applicant, label):
     return matches
 
 
+def choose_resume(selected, applicant, documents):
+    folder=Path(documents).resolve()
+    preferred=selected or applicant.get('matching',{}).get('resume_file','')
+    if preferred and preferred != 'None':
+        path=(folder/preferred).resolve()
+        return path.name if path.parent==folder and path.is_file() else ''
+    files=[p for p in folder.glob('*') if p.is_file() and p.suffix.lower() in ('.pdf','.docx','.txt')
+           and not re.search(r'cover[ _-]?letter|transcript|certificate',p.stem,re.I)]
+    named=[p for p in files if re.search(r'resume|\bcv\b',p.stem,re.I)]
+    candidates=named or files
+    return candidates[0].name if len(candidates)==1 else ''
+
+
+RESUME_METHOD = r'(?:auto\s*fill (?:with|using|from)|apply with|use) (?:a |your |my )?(?:resume|résumé|cv)'
+UPLOAD_RESUME = r'upload (?:a |your |my )?(?:resume|résumé|cv)'
+APPLY_ENTRY = r'apply|apply now|apply for (?:this )?(?:job|position)|start application|begin application'
+
+
+def entry_step(view):
+    """Ignore search filters on postings, but never treat a populated form as a posting."""
+    methods=[a for a in view['actions'] if re.fullmatch(RESUME_METHOD,normalize_label(a['label']))]
+    if methods:return methods[0]
+    uploads=[a for a in view['actions'] if re.fullmatch(UPLOAD_RESUME,normalize_label(a['label']))]
+    if uploads and not any(f['type']=='file' for f in view['fields']):return uploads[0]
+    relevant=[f for f in view['fields'] if not f['disabled'] and not (
+        f['type']=='search' or re.search(r'search|keyword|filter|job location',f['label'],re.I))]
+    if relevant:return None
+    choices=[a for a in view['actions'] if re.fullmatch(APPLY_ENTRY,normalize_label(a['label']))]
+    same_target=choices and choices[0].get('target') and len({a.get('target') for a in choices})==1
+    return choices[0] if len(choices)==1 or same_target else None
+
+
+def click_entry(page,view,action,resume,documents):
+    locator=_control(page,view,action)
+    if re.fullmatch(UPLOAD_RESUME,normalize_label(action['label'])):
+        path=(Path(documents)/resume).resolve()
+        if path.parent != Path(documents).resolve() or not path.is_file():raise ValueError('Select a saved resume first.')
+        with page.expect_file_chooser(timeout=4000) as chooser:
+            locator.click(timeout=4000)
+        chooser.value.set_files(str(path))
+        wait_for_upload(page)
+    else:locator.click(timeout=10000)
+
+
+def wait_for_upload(page):
+    """Allow visible ATS upload/parsing work to finish before advancing."""
+    deadline=time.monotonic()+15
+    page.wait_for_timeout(200)
+    while time.monotonic()<deadline:
+        busy=False
+        for frame in page.frames:
+            indicators=frame.locator('[aria-busy="true"],[role="progressbar"],[data-automation-id="loading"]')
+            if any(item.is_visible() for item in indicators.all()):busy=True;break
+        if not busy:return
+        page.wait_for_timeout(300)
+
+
+def select_combobox(page,view,field,value,key,applicant):
+    locator=_control(page,view,field)
+    frame=page.frames[field['frame']]
+    locator.click(timeout=2500)
+    controls=locator.get_attribute('aria-controls') or locator.get_attribute('aria-owns')
+    # Portalled menus can live elsewhere in the document. Use their explicit ID when present.
+    container=frame.locator('[id='+json.dumps(controls.split()[0])+']') if controls else frame.locator('body')
+    options=container.get_by_role('option')
+    editable=locator.evaluate('(el) => el.tagName === "INPUT" && !el.readOnly')
+    if editable:
+        # Search by the canonical name, even when the profile stores an abbreviation.
+        search=COUNTRIES.get(normalize_label(value),value) if key=='country' else STATES.get(value.upper(),value) if key=='state' else value
+        locator.fill(search,timeout=2500)
+    deadline=time.monotonic()+3
+    while True:
+        candidates=[o for o in options.all() if o.is_visible() and o.is_enabled() and o.get_attribute('aria-disabled')!='true']
+        chosen=option_matches(candidates,value,key,applicant,lambda o:o.inner_text())
+        if len(chosen)==1:
+            chosen[0].click(timeout=2500);return True
+        if len(chosen)>1 or time.monotonic()>=deadline:
+            locator.press('Escape',timeout=1000)
+            if editable:locator.fill('',timeout=1000)
+            return False
+        page.wait_for_timeout(200)
+
+
 def fill_supported(page, applicant, answers, resume, documents):
     """Re-inspect between controls; one changed widget must not invalidate all filling."""
     filled = []
@@ -101,7 +186,7 @@ def fill_supported(page, applicant, answers, resume, documents):
         matches = [f for f in view['fields'] if (f['frame'],f['label'],f['type']) == identity]
         if len(matches) != 1:continue
         field = matches[0]
-        if field['disabled'] or field['readonly'] or field['populated']:continue
+        if field['disabled'] or (field['readonly'] and field['type']!='combobox') or field['populated']:continue
         try:
             locator = _control(page,view,field)
             if field['type'] == 'file':
@@ -110,7 +195,7 @@ def fill_supported(page, applicant, answers, resume, documents):
                 other_doc = re.search(r'cover|letter|transcript|certificate',field['label'],re.I)
                 path = (Path(documents) / resume).resolve() if resume else None
                 if path and path.parent == Path(documents).resolve() and path.is_file() and not other_doc and (is_resume or len(uploads)==1):
-                    locator.set_input_files(str(path),timeout=2500);filled.append(field['label'])
+                    locator.set_input_files(str(path),timeout=2500);wait_for_upload(page);filled.append(field['label'])
                 continue
             value, key = value_for(field,applicant,answers)
             if value is None:continue
@@ -119,17 +204,7 @@ def fill_supported(page, applicant, answers, resume, documents):
                 if len(options) != 1:continue
                 locator.select_option(index=options[0]['index'],timeout=2500)
             elif field['type'] == 'combobox':
-                locator.click(timeout=2500)
-                options = page.frames[field['frame']].get_by_role('option')
-                # Searchable lists need the desired value typed before results appear.
-                if not options.count() and locator.evaluate('(el) => el.tagName === "INPUT" && !el.readOnly'):
-                    locator.fill(value,timeout=2500)
-                page.wait_for_timeout(250)
-                options = options.all()
-                chosen = option_matches([o for o in options if o.is_visible()],value,key,applicant,lambda o:o.inner_text())
-                if len(chosen) != 1:
-                    locator.press('Escape',timeout=1000);continue
-                chosen[0].click(timeout=2500)
+                if not select_combobox(page,view,field,value,key,applicant):continue
             else:
                 locator.fill(value,timeout=2500)
                 locator.press('Tab',timeout=1000)
@@ -141,7 +216,8 @@ def fill_supported(page, applicant, answers, resume, documents):
 
 
 def next_step(view):
-    patterns = (r'apply|apply now|apply for (?:this )?(?:job|position)|apply manually|apply without autofill|start application|begin application',) if not view['fields'] else (
+    resume_offered=any(re.fullmatch(RESUME_METHOD,normalize_label(a['label'])) for a in view['actions'])
+    patterns = (r'apply|apply now|apply for (?:this )?(?:job|position)|apply manually|apply without autofill|start application|begin application',) if not view['fields'] and not resume_offered else (
         r'(?:save\s*(?:and|&)\s*)?(?:next|continue)(?:\s+(?:application|step|to (?:next step|application|review)))?',)
     for pattern in patterns:
         candidates = [a for a in view['actions'] if re.fullmatch(pattern,normalize_label(a['label']))]
@@ -150,7 +226,7 @@ def next_step(view):
 
 
 def blocking_fields(view):
-    return [f for f in view['fields'] if f['required'] and not f['populated'] and not f['disabled'] and not f['readonly']]
+    return [f for f in view['fields'] if f['type']!='search' and f['required'] and not f['populated'] and not f['disabled'] and (not f['readonly'] or f['type']=='combobox')]
 
 
 def review_page(page):

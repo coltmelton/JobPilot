@@ -210,6 +210,46 @@ class WorkflowTests(unittest.TestCase):
         self.drive()
         self.assertNotIn('needs_information',self.events)
 
+    def test_intro_apply_prefers_resume_upload_then_fills_dropdowns(self):
+        folder=self.root/'documents';folder.mkdir()
+        (folder/'resume.txt').write_text('Test resume fixture',encoding='utf-8')
+        applicant=db.profile();applicant.update(country='US',state='NY');db.save_profile(applicant)
+        original=self.fixture_handler
+        visited=[]
+        def handler(route):
+            path=route.request.url.split('fixture.test')[-1];visited.append(path)
+            if path.startswith('/start'):
+                body='''<h1>Engineer posting</h1><label>Keywords<input type="search" required></label><button onclick="location.href='/method'">Apply</button>'''
+            elif path=='/method':
+                body='''<h1>Start your application</h1><a href="/manual">Apply manually</a><a href="/upload">Autofill with Resume</a>'''
+            elif path=='/upload':
+                body='''<h1>Autofill your application</h1><form><label>Resume<input type="file" required onchange="document.querySelector('#busy').hidden=false;setTimeout(()=>{document.querySelector('#busy').hidden=true;document.querySelector('button').disabled=false},900)"></label><div role="progressbar" id="busy" hidden>Parsing resume</div><button type="button" disabled onclick="if(this.form.reportValidity())location.href='/details'">Continue</button></form>'''
+            elif path=='/details':
+                body='''<h1>Applicant details</h1><form><label>First Name*<input required></label><label>Country<select required><option value="">Select</option><option>United States</option></select></label><button type="button" onclick="if(this.form.reportValidity())location.href='/review'">Next</button></form>'''
+            else:original(route);return
+            route.fulfill(content_type='text/html',body=body)
+        self.fixture_handler=handler
+        self.drive()
+        self.assertNotIn('/manual',visited)
+        self.assertIn('/upload',visited)
+        self.assertIn('/details',visited)
+        self.assertNotIn('needs_information',self.events)
+
+    def test_missing_resume_requests_it_instead_of_choosing_manual(self):
+        jid=self.add_job();rid=store.create_run([jid]);messages=[]
+        original=store.update_task
+        def handler(route):
+            route.fulfill(content_type='text/html',body='''<h1>Start application</h1><a href="/manual">Apply manually</a><button>Autofill with Resume</button>''')
+        def operator(task_id,state,message,snapshot=None,screenshot=None):
+            original(task_id,state,message,snapshot,screenshot)
+            if state=='needs_information':
+                messages.append(message)
+                store.send_command(task_id,'skip',snapshot['view_id'])
+        with patch('playwright.sync_api.sync_playwright',side_effect=lambda:self.routed_browser(handler)),patch.object(store,'update_task',side_effect=operator):
+            run_batch(rid)
+        self.assertEqual(store.tasks(rid)[0]['state'],'skipped')
+        self.assertTrue(any('resume' in message.lower() for message in messages))
+
     def test_missing_account_registration_and_verification_stay_in_app(self):
         self.drive(missing_account=True)
         self.assertIn('account_required',self.events)

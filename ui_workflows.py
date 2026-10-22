@@ -10,6 +10,7 @@ import streamlit as st
 import db
 import workflow_store as store
 from batch_control import force_stop_batches
+from form_intelligence import choose_resume
 from credential_vault import credential_status, save_credentials, allow_shared, forget_credentials
 
 
@@ -59,6 +60,7 @@ def render_batch(jobs):
             if st.button('Forget remembered routine answers'):
                 applicant=db.profile();applicant.pop('form_answers',None);db.save_profile(applicant);st.rerun()
     st.write('Applications run one at a time without opening Chrome windows. The batch fills supported fields and advances supported steps, then pauses here for login, account creation, verification, missing answers or final review.')
+    st.caption('Introductory Apply buttons are automatic. Resume autofill is preferred whenever offered; choose your resume below. Supported dropdowns use your saved profile and remembered answers.')
     if jobs:
         candidates=[job for job in jobs if job['status']!='Applied']
         options={f"#{job['id']} — {job['company']} — {job['title']}":job['id'] for job in candidates}
@@ -66,8 +68,9 @@ def render_batch(jobs):
         selected=st.multiselect('Choose jobs to prepare',list(options),default=list(options) if all_jobs else [])
         folder=db.DATA/'documents'
         files=sorted(path.name for path in folder.glob('*') if path.is_file()) if folder.exists() else []
-        resume_options=['None']+files
-        preferred=db.profile().get('matching',{}).get('resume_file','None')
+        automatic='Auto-select saved resume'
+        resume_options=[automatic]+files
+        preferred=choose_resume('',db.profile(),folder) or automatic
         resume=st.selectbox('Resume for batch',resume_options,index=resume_options.index(preferred) if preferred in resume_options else 0)
         use_shared=st.checkbox('Allow my shared saved login on the selected employer portals',disabled=not credential_status())
         if st.button('Launch selected applications',type='primary',disabled=not selected):
@@ -77,7 +80,7 @@ def render_batch(jobs):
                 if use_shared:
                     for job in candidates:
                         if job['id'] in ids:allow_shared(job['url'])
-                run_id=store.create_run(ids,'' if resume=='None' else resume)
+                run_id=store.create_run(ids,'' if resume==automatic else resume)
                 folder=db.DATA/'logs';folder.mkdir(parents=True,exist_ok=True)
                 with (folder/f'batch-{run_id}.log').open('w',encoding='utf-8') as log:
                     process=subprocess.Popen([sys.executable,str(db.ROOT/'batch.py'),'--run-id',run_id],cwd=db.ROOT,stdout=log,stderr=subprocess.STDOUT)
@@ -165,7 +168,7 @@ def render_inbox():
 
 
 def _render_fields(task,view):
-    fields=[field for field in view.get('fields',[]) if not field['disabled'] and not field['readonly']]
+    fields=[field for field in view.get('fields',[]) if not field['disabled'] and (not field['readonly'] or field['type']=='combobox')]
     if not fields:return
     st.caption('Enter only fields you want to change. Blank text and “Leave unchanged” preserve employer values. Credentials and one-time codes sent here are encrypted through the local queue.')
     changes={}

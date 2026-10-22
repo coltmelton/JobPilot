@@ -7,7 +7,8 @@ from urllib.parse import urlsplit
 
 import db
 import workflow_store as store
-from form_intelligence import fill_supported, next_step, blocking_fields, remember_answers, review_page
+from form_intelligence import (fill_supported, next_step, blocking_fields, remember_answers,
+                               review_page, entry_step, click_entry, choose_resume, RESUME_METHOD, UPLOAD_RESUME)
 from browser_sessions import session_lock
 from credential_vault import get_credentials, load_browser_state, save_browser_state
 from workflow_browser import (capture, preview, page_state, action_named, click_action,
@@ -54,6 +55,7 @@ def run_task(task, resume=''):
             paused = False
             steps = 0
             visited = {}
+            entry_attempts = {}
             view = None
             current_state = 'running'
 
@@ -131,7 +133,7 @@ def run_task(task, resume=''):
                                 attempted_login=None
                             elif action not in ('resume','fields'):
                                 raise ValueError('Unsupported command')
-                            paused=False;visited.clear();steps=0
+                            paused=False;visited.clear();entry_attempts.clear();steps=0
                         except Exception:
                             publish('needs_information', 'The employer page changed or could not accept that action. Review the refreshed controls and retry.');paused=True;continue
                     if paused:
@@ -165,6 +167,27 @@ def run_task(task, resume=''):
                     db.update_job(job['id'], status='In progress')
                     applicant = db.profile()
                     current_job = db.get_job(job['id'])
+                    if review_page(page):
+                        publish('review_ready');paused=True;continue
+                    resume = choose_resume(resume,applicant,db.DATA/'documents')
+                    entry = entry_step(view)
+                    if entry:
+                        entry_key=(page.url,entry['frame'],entry['label'])
+                        if entry_attempts.get(entry_key,0)<2:
+                            needs_resume=bool(re.fullmatch(RESUME_METHOD+'|'+UPLOAD_RESUME,entry['label'],re.I))
+                            if needs_resume and not resume:
+                                publish('needs_information','This site offers resume autofill. Save a resume in Documents and select it in Batch Launch; if several resumes exist, choose the right one and relaunch this batch.');paused=True;continue
+                            if needs_resume and any(f['type']=='file' for f in view['fields']):
+                                fill_supported(page,applicant,json.loads(current_job['answers']),resume,db.DATA/'documents')
+                                view=capture(page)
+                                entry=entry_step(view)
+                                if not entry:continue
+                            entry_attempts[entry_key]=entry_attempts.get(entry_key,0)+1
+                            store.update_task(task_id,'running','Selecting resume autofill and opening its upload step.' if needs_resume else 'Opening the application from the introductory Apply button.')
+                            try:click_entry(page,view,entry,resume,db.DATA/'documents')
+                            except Exception:
+                                page.wait_for_timeout(1000);continue
+                            page.wait_for_timeout(1200);continue
                     filled = fill_supported(page,applicant,json.loads(current_job['answers']),resume,db.DATA/'documents')
                     view = capture(page)
                     final = action_named(view, r'submit(?: application)?|send application|finish(?: application)?|review and submit')

@@ -7,7 +7,8 @@ from unittest.mock import patch
 from playwright.sync_api import sync_playwright
 
 import db
-from form_intelligence import fill_supported, value_for, next_step, blocking_fields, remember_answers, review_page
+from form_intelligence import (fill_supported, value_for, next_step, blocking_fields, remember_answers,
+                               review_page, entry_step, choose_resume, click_entry)
 from workflow_browser import capture
 
 
@@ -97,3 +98,48 @@ class IntelligenceTests(unittest.TestCase):
     def test_final_apply_on_review_page_requires_review(self):
         self.page.set_content('<h1>Review your application</h1><button>Apply now</button>')
         self.assertTrue(review_page(self.page))
+
+    def test_resume_method_preferred_over_manual_and_apply_handles_search(self):
+        self.page.set_content('<label>Keywords<input type="search"></label><button>Apply</button>')
+        self.assertEqual(entry_step(capture(self.page))['label'],'Apply')
+        self.page.set_content('<a href="#manual">Apply manually</a><a href="#resume">Autofill with Resume</a>')
+        self.assertEqual(entry_step(capture(self.page))['label'],'Autofill with Resume')
+        self.assertIsNone(next_step(capture(self.page)), 'Never fall back to manual when resume autofill is offered')
+        self.page.set_content('<label>First Name<input required></label><button>Apply</button>')
+        self.assertIsNone(entry_step(capture(self.page)))
+        self.page.set_content('<a href="https://fixture.test/start">Apply</a><a href="https://fixture.test/start">Apply</a>')
+        self.assertIsNotNone(entry_step(capture(self.page)))
+        self.page.set_content('<a href="https://fixture.test/one">Apply</a><a href="https://fixture.test/two">Apply</a>')
+        self.assertIsNone(entry_step(capture(self.page)))
+
+    def test_choose_resume_uses_explicit_then_profile_then_unique_resume(self):
+        (self.documents/'cover-letter.txt').write_text('Letter')
+        self.assertEqual(choose_resume('',{},self.documents),'')
+        (self.documents/'resume.txt').write_text('Resume')
+        self.assertEqual(choose_resume('',{},self.documents),'resume.txt')
+        (self.documents/'resume-2.txt').write_text('Another resume')
+        self.assertEqual(choose_resume('',{},self.documents),'')
+        self.assertEqual(choose_resume('',{'matching':{'resume_file':'resume-2.txt'}},self.documents),'resume-2.txt')
+        self.assertEqual(choose_resume('resume.txt',{},self.documents),'resume.txt')
+        self.assertEqual(choose_resume('../outside.txt',{},self.documents),'')
+
+    def test_upload_button_with_dynamically_created_file_input(self):
+        self.page.set_content('''<button onclick="const input=document.createElement('input');input.type='file';input.onchange=()=>document.body.dataset.uploaded=input.files[0].name;document.body.append(input);input.click()">Upload resume</button>''')
+        (self.documents/'resume.txt').write_text('Resume')
+        view=capture(self.page)
+        click_entry(self.page,view,entry_step(view),'resume.txt',self.documents)
+        self.assertEqual(self.page.locator('body').get_attribute('data-uploaded'),'resume.txt')
+
+    def test_delayed_search_options_scoped_to_active_list(self):
+        self.page.set_content('''<div role="option">New York</div>
+            <label>State<input role="combobox" aria-controls="states" required placeholder="Select" oninput="setTimeout(()=>document.querySelector('#states').innerHTML='<div role=option onclick=pick(this)>New York</div>',500)"></label>
+            <div id="states" role="listbox"></div><script>function pick(el){document.querySelector('input').value=el.textContent;el.parentElement.hidden=true;document.body.dataset.selected='yes'}</script>''')
+        fill_supported(self.page,{'state':'NY'},{},'',self.documents)
+        self.assertEqual(self.page.locator('body').get_attribute('data-selected'),'yes')
+
+    def test_readonly_custom_dropdown_is_selectable(self):
+        self.page.set_content('''<label>Country<input role="combobox" readonly required placeholder="Select" aria-controls="countries" onclick="document.querySelector('#countries').hidden=false"></label>
+            <div id="countries" hidden><div role="option" onclick="document.querySelector('input').value='United States';this.parentElement.hidden=true">United States</div></div>''')
+        self.assertTrue(blocking_fields(capture(self.page)))
+        fill_supported(self.page,{'country':'US'},{},'',self.documents)
+        self.assertFalse(blocking_fields(capture(self.page)))

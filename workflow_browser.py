@@ -30,7 +30,7 @@ DOM = r'''prefix => {
         type === 'combobox' && el.tagName !== 'INPUT' ? !!text(el).trim() :
         'value' in el ? !!String(el.value).trim() : !!text(el).trim();
       if (type === 'select' && /^\s*(?:select|choose|please select)/i.test(el.selectedOptions[0]?.textContent || '')) populated=false;
-      if (type === 'combobox' && /^\s*(?:select|choose|please select)/i.test(text(el))) populated=false;
+      if (type === 'combobox' && /^[\s\-–]*(?:select|choose|please select)/i.test(el.tagName === 'INPUT' ? el.value : text(el))) populated=false;
       if (type === 'radio' && el.name) populated = Array.from(document.querySelectorAll('input[type="radio"]')).some(other => other.name === el.name && other.form === el.form && other.checked);
       return {id,label:label(el).slice(0,180),type,populated,
         autocomplete:el.getAttribute('autocomplete') || '',
@@ -43,10 +43,10 @@ DOM = r'''prefix => {
     .map(el => ({el,label:(el.getAttribute('aria-label') || el.innerText || el.value || '').trim().replace(/\s+/g,' ')}))
     .filter(({el,label}) => label && label.length < 160 &&
       !/delete account|withdraw application|log out|sign out/i.test(label) &&
-      (el.tagName !== 'A' || /apply|sign.?in|log.?in|create.*account|register|next|continue|application|without autofill|manually/i.test(label)))
+      (el.tagName !== 'A' || /apply|sign.?in|log.?in|create.*account|register|next|continue|application|autofill|upload.*(?:resume|cv)|without autofill|manually/i.test(label)))
     .slice(0,70).map(({el,label},index) => {
       const id=prefix+'-a'+index;el.setAttribute('data-jobpilot-action',id);
-      return {id,label,role:el.getAttribute('role') || 'button'};
+      return {id,label,role:el.getAttribute('role') || 'button',destination:el.tagName === 'A' ? el.href : ''};
     });
   const error_count = Array.from(document.querySelectorAll('[role="alert"],.error-message,[data-automation-id="errorMessage"]')).filter(el => visible(el) && text(el)).length;
   return {fields,actions,error_count};
@@ -66,7 +66,9 @@ def capture(page):
             data = frame.evaluate(DOM, f'{view_id}-{index}')
             origin=urlsplit(frame.url).netloc or urlsplit(page.url).netloc
             fields.extend(dict(row, frame=index, origin=origin) for row in data['fields'])
-            actions.extend(dict(row, frame=index, origin=origin) for row in data['actions'])
+            for row in data['actions']:
+                destination=row.pop('destination','')
+                actions.append(dict(row,frame=index,origin=origin,target=hashlib.sha256(destination.encode()).hexdigest() if destination else ''))
             error_count += data.get('error_count', 0)
         except Exception:
             continue
@@ -94,7 +96,7 @@ def apply_changes(page, view, changes, documents_folder):
         if key not in fields:
             raise ValueError('Unknown control. Refresh the employer view.')
         field = fields[key]
-        if field['disabled'] or field['readonly']:
+        if field['disabled'] or (field['readonly'] and field['type']!='combobox'):
             raise ValueError('This field cannot be edited.')
         locator = _control(page, view, field)
         pending.append((field, locator, value))
