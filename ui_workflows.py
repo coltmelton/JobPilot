@@ -52,6 +52,12 @@ def render_batch(jobs):
             st.success('All JobPilot batches stopped. You can start a new batch.')
         except Exception as exc:
             st.error(f'Could not fully stop the batch: {exc}')
+    remembered=db.profile().get('form_answers',{})
+    if remembered:
+        with st.expander(f'Remembered routine answers ({len(remembered)})'):
+            st.dataframe(pd.DataFrame([{'Question':question,'Answer':answer} for question,answer in remembered.items()]),hide_index=True)
+            if st.button('Forget remembered routine answers'):
+                applicant=db.profile();applicant.pop('form_answers',None);db.save_profile(applicant);st.rerun()
     st.write('Applications run one at a time without opening Chrome windows. The batch fills supported fields and advances supported steps, then pauses here for login, account creation, verification, missing answers or final review.')
     if jobs:
         candidates=[job for job in jobs if job['status']!='Applied']
@@ -186,4 +192,5 @@ def _render_fields(task,view):
             else:
                 value=st.text_area(label,key=key) if kind=='textarea' else st.text_input(label,type='password' if kind=='password' else 'default',key=key)
                 if value:changes[field['id']]=value
-        if st.form_submit_button('Send entries to employer page'):_send(task,view,'fields',changes=changes)
+        remember=st.checkbox('Remember these routine answers for other applications',key=f"remember_{view['view_id']}",help='Reuses exact matching questions. Passwords, verification codes, certifications and sensitive questions are excluded.')
+        if st.form_submit_button('Send entries to employer page'):_send(task,view,'fields',changes=changes,remember=remember)

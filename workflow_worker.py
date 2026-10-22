@@ -7,11 +7,11 @@ from urllib.parse import urlsplit
 
 import db
 import workflow_store as store
-from autofill import fill_current,FIELDS
+from form_intelligence import fill_supported, next_step, blocking_fields, remember_answers, review_page
 from browser_sessions import session_lock
 from credential_vault import get_credentials, load_browser_state, save_browser_state
 from workflow_browser import (capture, preview, page_state, action_named, click_action,
-                              apply_changes, autofill_login,fill_known_selects)
+                              apply_changes, autofill_login)
 
 
 MESSAGES = {
@@ -28,7 +28,11 @@ MESSAGES = {
 def progress_signature(page, view):
     headings = page.locator('h1,h2,[role="heading"]').all_text_contents()
     shape = [(f['frame'], f['label'], f['type'], f['required'], f['populated']) for f in view['fields']]
-    return hashlib.sha256(json.dumps([page.url, headings, shape]).encode()).hexdigest()
+    return hashlib.sha256(json.dumps([page.url, headings, shape, [a['label'] for a in view['actions']]]).encode()).hexdigest()
+
+
+def login_stage(page, view):
+    return (page.url, tuple((f['label'], f['type']) for f in view['fields'] if not f['disabled']))
 
 
 def run_task(task, resume=''):
@@ -45,11 +49,11 @@ def run_task(task, resume=''):
             browser = pw.chromium.launch(headless=True)
             context = browser.new_context(storage_state=load_browser_state(job['url']), viewport={'width':1280,'height':900})
             page = context.new_page()
-            attempted_login = False
+            attempted_login = None
             submission_attempted = False
             paused = False
             steps = 0
-            visited = set()
+            visited = {}
             view = None
             current_state = 'running'
 
@@ -71,7 +75,14 @@ def run_task(task, resume=''):
                 save_browser_state(context, job['url'])
 
             try:
-                page.goto(job['url'], wait_until='domcontentloaded', timeout=45000)
+                for attempt in range(2):
+                    try:
+                        page.goto(job['url'], wait_until='domcontentloaded', timeout=30000)
+                        break
+                    except Exception:
+                        if attempt or store.get_run(run_id)['state'] != 'running':raise
+                        store.touch(run_id,task_id)
+                        page.wait_for_timeout(1000)
                 page.wait_for_timeout(1000)
                 while browser.is_connected():
                     run = store.get_run(run_id)
@@ -102,18 +113,23 @@ def run_task(task, resume=''):
                                 publish('manual_browser');paused=True;continue
                             if action == 'fields':
                                 apply_changes(page, view, command.get('changes', {}), db.DATA/'documents')
-                                publish(current_state, 'Your entries were sent to the employer page. Choose an employer action or Resume automation.');continue
+                                if command.get('remember'):remember_answers(view,command.get('changes', {}))
+                                # Complete routine pages immediately after receiving the missing answer.
+                                if current_state == 'needs_information':
+                                    paused=False;visited.clear();steps=0
+                                else:
+                                    publish(current_state, 'Your entries were sent to the employer page. Choose an employer action or Resume automation.');continue
                             if action == 'act':
                                 selected = next((a for a in view['actions'] if a['id'] == command.get('action_id')), None)
                                 if not selected:raise ValueError('Action changed')
                                 # Every submit-like action here originates from a specific user click.
-                                submission_attempted = submission_attempted or bool(re.search(r'submit|send application|finish',selected['label'],re.I) or re.fullmatch(r'apply(?: now)?',selected['label'],re.I) and view['fields'])
+                                submission_attempted = submission_attempted or bool(re.search(r'submit|send application|finish',selected['label'],re.I) or re.fullmatch(r'apply(?: now)?',selected['label'],re.I) and (view['fields'] or current_state=='review_ready'))
                                 click_action(page, view, selected['id'])
-                                if re.fullmatch(r'sign\s*in|log\s*in|login', selected['label'], re.I):attempted_login=True
+                                if re.fullmatch(r'sign\s*in|log\s*in|login', selected['label'], re.I):attempted_login=login_stage(page,view)
                                 page.wait_for_timeout(1200)
                             elif action == 'retry_login':
-                                attempted_login=False
-                            elif action != 'resume':
+                                attempted_login=None
+                            elif action not in ('resume','fields'):
                                 raise ValueError('Unsupported command')
                             paused=False;visited.clear();steps=0
                         except Exception:
@@ -135,12 +151,13 @@ def run_task(task, resume=''):
                     if state in ('account_required', 'verification_required'):
                         publish(state);paused=True;continue
                     if state == 'login':
-                        if attempted_login:
+                        stage = login_stage(page,view)
+                        if attempted_login == stage:
                             publish('login_failed');paused=True;continue
                         credentials = get_credentials(page.url)
                         if not credentials:
                             publish('needs_credentials');paused=True;continue
-                        attempted_login=True
+                        attempted_login=stage
                         store.update_task(task_id, 'running', 'Attempting sign-in with the credentials approved for this portal.')
                         if autofill_login(page, view, credentials):
                             page.wait_for_timeout(1200);continue
@@ -148,25 +165,35 @@ def run_task(task, resume=''):
                     db.update_job(job['id'], status='In progress')
                     applicant = db.profile()
                     current_job = db.get_job(job['id'])
-                    fill_current(page, applicant, json.loads(current_job['answers']), resume)
+                    filled = fill_supported(page,applicant,json.loads(current_job['answers']),resume,db.DATA/'documents')
                     view = capture(page)
-                    if fill_known_selects(page,view,applicant,FIELDS):view=capture(page)
                     final = action_named(view, r'submit(?: application)?|send application|finish(?: application)?|review and submit')
-                    if final:
+                    if final or review_page(page):
                         publish('review_ready');paused=True;continue
-                    missing = [field for field in view['fields'] if field['required'] and not field['populated'] and not field['disabled']]
+                    missing = blocking_fields(view)
                     if missing:
-                        publish('needs_information');paused=True;continue
-                    if not view['fields']:
-                        button = action_named(view, r'apply|apply now|apply for (?:this )?(?:job|position)|apply manually|apply without autofill')
-                    else:
-                        button = action_named(view, r'next|continue|save (?:and|&) continue')
+                        # Dependent country/state widgets often appear only after blur.
+                        page.wait_for_timeout(700)
+                        filled += fill_supported(page,applicant,json.loads(current_job['answers']),resume,db.DATA/'documents')
+                        view=capture(page);missing=blocking_fields(view)
+                    if missing:
+                        labels=', '.join(dict.fromkeys(f['label'] for f in missing))
+                        publish('needs_information', f'Filled {len(filled)} supported field(s). Still needs your answer: {labels[:400]}. Send these entries here; routine steps then resume automatically.');paused=True;continue
+                    button = next_step(view)
                     signature = progress_signature(page, view)
-                    if not button or signature in visited:
-                        publish('needs_information', 'No unambiguous next step was found, or the employer did not advance. Review the page and choose its action below.');paused=True;continue
-                    visited.add(signature)
+                    if not button:
+                        attempts=visited.get(signature,0)
+                        if attempts<2:
+                            visited[signature]=attempts+1;page.wait_for_timeout(1500);continue
+                        publish('needs_information', 'No supported next step appeared after waiting for the page. Choose an employer action below.');paused=True;continue
+                    if visited.get(signature,0)>=2:
+                        reason='The employer reports a validation error. Check the page preview.' if view.get('error_count') else 'The employer did not advance after two attempts.'
+                        publish('needs_information', reason+' Review the current answers and choose an employer action below.');paused=True;continue
+                    visited[signature]=visited.get(signature,0)+1
                     store.update_task(task_id, 'running', 'Filling available answers and advancing to the next supported application step.')
-                    click_action(page, view, button['id'])
+                    try:click_action(page, view, button['id'])
+                    except Exception:
+                        page.wait_for_timeout(1000);continue
                     page.wait_for_timeout(1000)
             finally:
                 try:save_browser_state(context, job['url'])

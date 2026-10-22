@@ -261,3 +261,11 @@ directories are retained, but are not the new workflow's credential vault.
 ## Stopping a batch
 
 Open **Batch Launch** and click **Force stop all batches** to immediately close this project's batch workers and their browser processes, including older batches. The app stays open. Unfinished tasks are marked stopped and queued commands are cleared; you can launch a new batch. Unsaved employer form entries may be lost. Applications already submitted remain submitted. **Stop this batch** in the inbox requests a normal stop instead.
+
+## Smarter routine form handling
+
+Background batches recognize required markers, common profile-field aliases and HTML autocomplete hints, native and supported custom dropdowns, country/state names and abbreviations, and iframe form fields. Resume uploads target resume fields rather than cover-letter fields. Slow pages and unchanged steps receive bounded waits/retries; two-stage email/password login is supported with approved credentials.
+
+When the inbox needs an answer, it lists the missing fields. Sending routine missing entries resumes automation automatically. Check **Remember these routine answers for other applications** to reuse your exact answers to matching questions, such as referral source. Review or delete these answers in Batch Launch. Answers stay in the local profile; passwords, verification codes, sensitive questions and certifications are excluded from this memory.
+
+These decisions use local profile facts and explicit answers; no model service receives your resume or page content. Unknown answers, account registration, verification and final submission still require your input. Stop and relaunch any already-running batch to load updated worker code.

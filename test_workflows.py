@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import db
+import browser_sessions
 import credential_vault as vault
 import workflow_store as store
 from workflow_browser import capture, apply_changes, click_action, page_state,autofill_login,fill_known_selects
@@ -20,7 +21,7 @@ class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)
-        self.patchers=[patch.multiple(db,DATA=self.root,DB=self.root/'jobs.sqlite3'),patch.object(vault,'VAULT_DIR',self.root/'private')]
+        self.patchers=[patch.multiple(db,DATA=self.root,DB=self.root/'jobs.sqlite3'),patch.object(vault,'VAULT_DIR',self.root/'private'),patch.object(browser_sessions,'DATA',self.root)]
         for patcher in self.patchers:patcher.start();self.addCleanup(patcher.stop)
         db.save_profile({'first_name':'Example','email':'candidate@example.test'})
 
@@ -163,6 +164,51 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.paths.count('/login'),1,'Second job should reuse the encrypted login session')
         self.assertEqual(self.events.count('review_ready'),2)
         self.assertIn('needs_credentials',self.events)
+
+    def test_two_step_login_handles_email_then_password(self):
+        original=self.fixture_handler
+        def handler(route):
+            path=route.request.url.split('fixture.test')[-1]
+            if path=='/login':
+                route.fulfill(content_type='text/html',body='''<h1>Sign in</h1><label>Email<input type="email" required></label><button onclick="location.href='/password'">Continue</button>''')
+            elif path=='/password':
+                route.fulfill(content_type='text/html',body='''<h1>Sign in</h1><label>Password<input type="password" required></label><button onclick="document.cookie='fixture_auth=yes; path=/';location.href='/form'">Sign in</button>''')
+            else:original(route)
+        self.fixture_handler=handler
+        self.drive()
+        self.assertNotIn('login_failed',self.events)
+
+    def test_apply_button_on_review_waits_for_explicit_user_action(self):
+        original_handler=self.fixture_handler
+        original_operator=self.operator
+        def handler(route):
+            if route.request.url.endswith('/review'):
+                route.fulfill(content_type='text/html',body='''<h1>Review your application</h1><button onclick="location.href='/done'">Apply now</button>''')
+            else:original_handler(route)
+        def operator(task_id,state,message,snapshot=None,screenshot=None):
+            if state=='review_ready' and snapshot and snapshot['url'].endswith('/review'):
+                self.original_update(task_id,state,message,snapshot,screenshot)
+                self.events.append(state)
+                self.assertNotEqual(db.get_job(store.get_task(task_id)['job_id'])['status'],'Applied')
+                action=next(a for a in snapshot['actions'] if a['label']=='Apply now')
+                store.send_command(task_id,'act',snapshot['view_id'],action_id=action['id'])
+            else:original_operator(task_id,state,message,snapshot,screenshot)
+        self.fixture_handler=handler;self.operator=operator
+        self.drive()
+        self.assertIn('review_ready',self.events)
+
+    def test_delayed_apply_and_starred_fields_continue_without_help(self):
+        original=self.fixture_handler
+        def handler(route):
+            path=route.request.url.split('fixture.test')[-1]
+            if path.startswith('/start'):
+                route.fulfill(content_type='text/html',body='''<h1>Engineer</h1><div id="ready"></div><script>setTimeout(()=>{const btn=document.createElement('button');btn.textContent='Apply now';btn.onclick=()=>location.href='/routine';document.querySelector('#ready').append(btn)},1800)</script>''')
+            elif path=='/routine':
+                route.fulfill(content_type='text/html',body='''<h1>Applicant details</h1><label>First Name*<input required></label><button onclick="location.href='/review'">Save &amp; Continue</button>''')
+            else:original(route)
+        self.fixture_handler=handler
+        self.drive()
+        self.assertNotIn('needs_information',self.events)
 
     def test_missing_account_registration_and_verification_stay_in_app(self):
         self.drive(missing_account=True)

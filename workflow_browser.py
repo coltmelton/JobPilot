@@ -19,18 +19,21 @@ DOM = r'''prefix => {
     Array.from(el.labels || []).map(text).join(' ') ||
     text(el.closest('[data-automation-id^="formField"],.form-group')?.querySelector('label')) ||
     el.getAttribute('placeholder') || el.name || 'Unlabelled field';
-  const fields = Array.from(document.querySelectorAll('input,textarea,select,[role="combobox"],[role="checkbox"],[role="radio"]'))
-    .filter(el => visible(el) && !['hidden','submit','button','reset','image'].includes(el.type))
+  const fields = Array.from(document.querySelectorAll('input,textarea,select,[role="combobox"],[role="checkbox"],[role="radio"],button[aria-haspopup="listbox"]'))
+    .filter(el => (visible(el) || el.type === 'file') && (!['hidden','submit','button','reset','image'].includes(el.type) || el.getAttribute('aria-haspopup') === 'listbox'))
     .slice(0,100).map((el,index) => {
       const id = prefix+'-f'+index;
       el.setAttribute('data-jobpilot-control',id);
-      const type = (el.getAttribute('type') || el.getAttribute('role') || (el.tagName === 'TEXTAREA' ? 'textarea' : el.tagName === 'SELECT' ? 'select' : 'text')).toLowerCase();
+      const type = (el.tagName === 'SELECT' ? 'select' : el.getAttribute('aria-haspopup') === 'listbox' ? 'combobox' : el.getAttribute('role') || el.getAttribute('type') || (el.tagName === 'TEXTAREA' ? 'textarea' : 'text')).toLowerCase();
       let populated = type === 'password' ? null : type === 'file' ? !!el.files?.length :
         ['checkbox','radio'].includes(type) ? (el.checked ?? el.getAttribute('aria-checked') === 'true') :
+        type === 'combobox' && el.tagName !== 'INPUT' ? !!text(el).trim() :
         'value' in el ? !!String(el.value).trim() : !!text(el).trim();
       if (type === 'select' && /^\s*(?:select|choose|please select)/i.test(el.selectedOptions[0]?.textContent || '')) populated=false;
       if (type === 'combobox' && /^\s*(?:select|choose|please select)/i.test(text(el))) populated=false;
+      if (type === 'radio' && el.name) populated = Array.from(document.querySelectorAll('input[type="radio"]')).some(other => other.name === el.name && other.form === el.form && other.checked);
       return {id,label:label(el).slice(0,180),type,populated,
+        autocomplete:el.getAttribute('autocomplete') || '',
         required:!!el.required || el.getAttribute('aria-required') === 'true',
         disabled:!!el.disabled || el.getAttribute('aria-disabled') === 'true',readonly:!!el.readOnly,
         options:el.tagName === 'SELECT' ? Array.from(el.options).map((o,i) => ({index:i,label:o.textContent.trim().slice(0,160),disabled:o.disabled})).slice(0,200) : []};
@@ -42,10 +45,11 @@ DOM = r'''prefix => {
       !/delete account|withdraw application|log out|sign out/i.test(label) &&
       (el.tagName !== 'A' || /apply|sign.?in|log.?in|create.*account|register|next|continue|application|without autofill|manually/i.test(label)))
     .slice(0,70).map(({el,label},index) => {
-      const id=prefix+'-a'+index;el.setAttribute('data-jobpilot-control',id);
+      const id=prefix+'-a'+index;el.setAttribute('data-jobpilot-action',id);
       return {id,label,role:el.getAttribute('role') || 'button'};
     });
-  return {fields,actions};
+  const error_count = Array.from(document.querySelectorAll('[role="alert"],.error-message,[data-automation-id="errorMessage"]')).filter(el => visible(el) && text(el)).length;
+  return {fields,actions,error_count};
 }'''
 
 
@@ -56,17 +60,18 @@ def safe_url(url):
 
 def capture(page):
     view_id = uuid.uuid4().hex
-    fields, actions = [], []
+    fields, actions, error_count = [], [], 0
     for index, frame in enumerate(page.frames):
         try:
             data = frame.evaluate(DOM, f'{view_id}-{index}')
             origin=urlsplit(frame.url).netloc or urlsplit(page.url).netloc
             fields.extend(dict(row, frame=index, origin=origin) for row in data['fields'])
             actions.extend(dict(row, frame=index, origin=origin) for row in data['actions'])
+            error_count += data.get('error_count', 0)
         except Exception:
             continue
     return {'view_id': view_id, 'url': safe_url(page.url), 'portal': portal_name(page.url),
-            'document': hashlib.sha256(page.url.encode()).hexdigest(), 'fields': fields, 'actions': actions}
+            'document': hashlib.sha256(page.url.encode()).hexdigest(), 'fields': fields, 'actions': actions, 'error_count': error_count}
 
 
 def _control(page, view, item):
@@ -75,8 +80,9 @@ def _control(page, view, item):
     frames = page.frames
     if item['frame'] >= len(frames):
         raise ValueError('Frame changed. Refresh the employer view.')
-    locator = frames[item['frame']].locator(f'[data-jobpilot-control="{item["id"]}"]')
-    if locator.count() != 1 or not locator.is_visible():
+    attribute = 'data-jobpilot-control' if 'type' in item else 'data-jobpilot-action'
+    locator = frames[item['frame']].locator(f'[{attribute}="{item["id"]}"]')
+    if locator.count() != 1 or (item.get('type') != 'file' and not locator.is_visible()):
         raise ValueError('Control changed. Refresh the employer view.')
     return locator
 
@@ -150,11 +156,11 @@ def page_state(page, view):
 def autofill_login(page, view, credentials):
     passwords = [field for field in view['fields'] if field['type'] == 'password' and not field['disabled']]
     emails = [field for field in view['fields'] if field['type'] == 'email' or re.search(r'email|user\s*name', field['label'], re.I)]
-    if len(passwords) > 1 or len(emails) != 1:
+    if len(passwords) > 1 or len(emails) > 1 or not (passwords or emails):
         return False
     if any(field.get('origin') != urlsplit(page.url).netloc for field in emails+passwords):
         return False  # Never send a portal's saved credentials to a different iframe origin.
-    changes = {emails[0]['id']: credentials['email']}
+    changes = {emails[0]['id']: credentials['email']} if emails else {}
     if passwords:changes[passwords[0]['id']] = credentials['password']
     from db import DATA
     apply_changes(page, view, changes, DATA/'documents')
